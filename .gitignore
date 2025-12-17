@@ -1,0 +1,9 @@
+# All files of type .csv or type .png or type .wav
+*.csv
+*.png
+*.wav
+
+
+# Experimental data inside MATLAB workflows
+MATLAB/experimental_processing/data/
+
