@@ -36,7 +36,7 @@ c_o = 340; %Speed of sound (m/s)
 rho_o = 1.02; %Air Density at STP
 
 % Vector Sensor Array(s) Parameters;
-N_a = 2; %Number of independent arrays
+N_a = 1; %Number of independent arrays
 N_v = 1; %No. of vector sensors
 d_y = 0.1; %Vector sensor y axis spacing (m)
 delta = 0.0425; %MEMS colocation spacing (m)
@@ -49,7 +49,7 @@ A1_coord = [x_a1;y_a1;z_a1];
 
 % Array centre geom 2
 lambda = c_o/source_frequencies(1,:);
-a_spacing = sqrt(((5*lambda)^2)/2); %x and y spacing for 10*lambda distance
+a_spacing = sqrt(((5*lambda)^2)/2); %x and y spacing for 5*lambda distance
 x_a2 = x_a1-a_spacing; % Geometric centre x-coordinate
 z_a2 = 0; % Array centre z-coordinate
 y_a2 = y_a1-a_spacing; % Geometric centre y-coordinate
@@ -313,8 +313,11 @@ end
 % Array positioning information
 array_separation = norm(A2_coord - A1_coord);
 fprintf('\nArray 1 centre: (%.3f, %.3f, %.3f) m\n', x_a1, y_a1, z_a1);
-fprintf('Array 2 centre: (%.3f, %.3f, %.3f) m\n', x_a2, y_a2, z_a2);
-fprintf('Array separation distance: %.3f m\n', array_separation);
+
+if N_a > 1
+    fprintf('Array 2 centre: (%.3f, %.3f, %.3f) m\n', x_a2, y_a2, z_a2);
+    fprintf('Array separation distance: %.3f m\n', array_separation);
+end
 
 if num_sources == 1
     freq_display = source_frequencies(1);
