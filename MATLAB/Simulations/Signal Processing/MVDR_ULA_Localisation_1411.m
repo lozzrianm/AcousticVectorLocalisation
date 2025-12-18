@@ -9,12 +9,12 @@ clc; clear all; close all;
 
 %% DEFINE INPUT VARIABLES %%
 
-csv_filename = 'generatedsignal.csv';
+csv_filename = 'generatedsignal1.csv';
 
 % Array Parameters
-N_mics = 11; %number of receiving elements
+N_mics = 4; %number of receiving elements
 d_y = 0.08; %sensor spacing (m)
-x_a = 2; %array centre x coordinate (m)
+x_a = 0; %array centre x coordinate (m)
 z_a = 0; %array centre z coordinate (m)
 y_a = 0; %array centre y coordinate (m)
 
@@ -30,12 +30,12 @@ loading = 1e-4; %set regularisation parameter (loading var in 2020 script)
 x_scan_points = 200;
 y_scan_points = 200;
 x_margin = 3; %(m)
-y_margin = 1; %(m)
+y_margin = 2; %(m)
 
 % Visualisation Parameters
 % Source position [x, y] (m) - for reference
-source_x = 0;
-source_y = -0.25;
+source_x = -1;
+source_y = 0;
 source_positions = [source_x,source_y,0];
 
 %% MICROPHONE CALIBRATION DATA PROCESSING %%
@@ -311,9 +311,16 @@ fprintf('Angular Error: %.4f deg\n', angular_error_deg);
 %% BEAM PATTERN ANALYSIS %%
 fprintf('\n<strong>GENERATING BEAM PATTERNS</strong>\n');
 
-array_centre = [x_a; y_a];
-plot_beam_pattern(response_db, X_grid, Y_grid, ...
-    array_centre, "Array Beam Pattern", source_positions(:,1:2));
+% Determine radius from source position
+array_centre_2d = [x_a; y_a];
+distances = sqrt(sum((source_positions(:,1:2) - array_centre_2d').^2, 2));
+radius = median(distances);
+fprintf('Using radius = %.3f m (median source distance)\n', radius);
+
+% Compute near-field beam pattern
+[theta_deg, beam_pattern, fig_handle] = beam_pattern_ula(...
+    r, mic_positions, array_centre_2d, source_positions(:,1:2), ...
+    bin_freqs, c_0, loading, radius, 'Array Beam Pattern (MVDR)');
 
 %% FUNCTION DEFINITION %%
 
@@ -502,7 +509,7 @@ function plot_1dscan_mvdr(r, mic_positions, source_y, bin_freqs, c_0, loading)
     
     % Scan along y-axis at fixed x and z
     y_scan_line = linspace(source_y - 0.5, source_y + 0.5, 200);
-    x_fixed = 0; 
+    x_fixed = -1; 
     z_fixed = 0;
 
     % Build candidate points
@@ -533,50 +540,95 @@ function plot_1dscan_mvdr(r, mic_positions, source_y, bin_freqs, c_0, loading)
     set(gca, 'FontName', 'Times New Roman', 'FontSize', 14);
 end
 
-% FUNCTION: PLOT BEAM PATTERN
-% Generate beam pattern plot by scanning azimuthal angle around array centre
-function [theta_deg, beam_pattern, fig_handle] = plot_beam_pattern(...
-    response_db, X_grid, Y_grid, array_centre, plot_title, source_positions)
 
-    % Reshape response to grid
-    grid_response = reshape(response_db, size(X_grid));
+% FUNCTION: COMPUTE NEAR-FIELD BEAM PATTERN FOR ULA MVDR
+% Compute proper beam pattern by evaluating MVDR response at each angle
+function [theta_deg, beam_pattern, fig_handle] = beam_pattern_ula(...
+    r, mic_positions, array_centre, source_positions, bin_freqs, c_0, ...
+    loading, radius, plot_title)
     
-    % Determine seach radius from source positions
-    % Use median distance to sources
-    distances = sqrt(sum((source_positions - array_centre').^2, 2));
-    radius = median(distances);
-    fprintf('  Using radius = %.3f m (median source distance)\n', radius);
-
-    % Define angular resolution
-    num_angles = 360; % 1 degree resolution
+    fprintf('\n<strong>Computing Near-Field Beam Pattern (ULA MVDR):</strong>\n');
+    fprintf('  Range: %.3f m\n', radius);
+    fprintf('  Array centre: (%.3f, %.3f) m\n', array_centre);
+    
+    % Define angular resolution (1 degree)
+    num_angles = 360;
     theta_deg = linspace(0, 360, num_angles + 1);
-    theta_deg = theta_deg(1:end-1); % Remove duplicate at 360
+    theta_deg = theta_deg(1:end-1); % Remove duplicate at 360°
     theta_rad = deg2rad(theta_deg);
     
-    % Calculate query points along each radial direction
-    x_query = array_centre(1) + radius * sin(theta_rad);  
-    y_query = array_centre(2) + radius * cos(theta_rad); %0deg is +Y direction
+    % Get array dimensions
+    Nr = size(r, 1);
+    num_bins = size(r, 3);
     
-    % Interpolate beam response at query points
-    beam_pattern = interp2(X_grid, Y_grid, grid_response, x_query, y_query, 'linear');
+    % Initialise beam pattern storage
+    mvdr_responses = zeros(num_angles, num_bins);
     
-    % Handle any NaN values (points outside grid)
-    if any(isnan(beam_pattern))
-        warning('Some angles fall outside the scanned grid. Consider reducing radius or expanding scan area.');
-        % Fill NaN with minimum value
-        beam_pattern(isnan(beam_pattern)) = min(beam_pattern(~isnan(beam_pattern)));
+    % Compute MVDR response for each angle and frequency
+    for jf = 1:num_bins
+        k = 2 * pi * bin_freqs(jf) / c_0; % Wave number
+        rf = squeeze(r(:, :, jf)); % Covariance matrix for this frequency bin
+        
+        % Eigenvalue decomposition for stability
+        [ur, er] = eig(rf);
+        erv = real(diag(er));
+        erv = max(erv, 1e-12); % Safety check for negative eigenvalues
+        
+        % For each angular direction
+        for angle_idx = 1:num_angles
+            % Calculate source position at this angle and range
+            % 0° is along +Y axis (North), increases clockwise
+            x_pos = array_centre(1) + radius * sin(theta_rad(angle_idx));
+            y_pos = array_centre(2) + radius * cos(theta_rad(angle_idx));
+            source_pos = [x_pos; y_pos; 0];
+            
+            % Calculate steering vector for this direction
+            r_lm = sqrt(sum((mic_positions - source_pos).^2, 1));
+            v1 = exp(-1i * k * r_lm).'; % Steering vector
+            
+            % Conventional beamformer output (for adaptive regularisation)
+            cbf_out = real(v1' * rf * v1);
+            
+            % Adaptive regularisation based on CBF output
+            % (matching your mvdr_beamforming implementation)
+            lambda = loading * cbf_out;
+            if lambda == 0
+                lambda = loading; % Default to fixed loading
+            end
+            
+            % Weighted MVDR using eigendecomposition
+            rxv = (ur * diag(1 ./ (erv + lambda)) * ur') * v1;
+            denominator = v1' * rxv;
+            
+            if abs(denominator) > 1e-12
+                vmvdr = rxv / denominator;
+                % Use same formulation as your mvdr_beamforming function
+                mvdr_responses(angle_idx, jf) = abs(vmvdr' * rf * vmvdr);
+            else
+                mvdr_responses(angle_idx, jf) = 0;
+            end
+        end
+        
+        if mod(jf, 10) == 0 || jf == num_bins
+            fprintf('  Processed %d/%d frequency bins\r', jf, num_bins);
+        end
     end
+    fprintf('\n');
     
-    % Normalise to 0 dB maximum
+    % Sum across frequencies for broadband response
+    beam_pattern_linear = sum(mvdr_responses, 2);
+    
+    % Convert to dB and normalise
+    beam_pattern = 10*log10(beam_pattern_linear + eps);
     beam_pattern = beam_pattern - max(beam_pattern);
-    % Create figure with polar plot only
+    
+    % Create polar plot
     fig_handle = figure('Name', plot_title, 'Position', [100, 100, 700, 700]);
     
-    % Polar plot
     polarplot(theta_rad, beam_pattern, 'b-', 'LineWidth', 2);
     ax = gca;
     ax.ThetaDir = 'clockwise';
-    ax.ThetaZeroLocation = 'top';
+    ax.ThetaZeroLocation = 'top'; % 0° is North (+Y direction)
     rlim([min(beam_pattern), 0]);
     
     % Add radial grid labels
@@ -591,11 +643,8 @@ function [theta_deg, beam_pattern, fig_handle] = plot_beam_pattern(...
             % Calculate angle to source from array centre
             source_vec = source_positions(src, :)' - array_centre;
             source_angle_rad = atan2(source_vec(1), source_vec(2));
-            % 0deg sits at positive y axis
-            if source_angle_rad < 0
-                source_angle_rad = source_angle_rad + 2*pi;
-            end
-            % Polar plot uses standard math convention
+            
+            % Plot radial line to source direction
             r_lim = rlim;
             polarplot([source_angle_rad, source_angle_rad], r_lim, '--r', 'LineWidth', 2, ...
                 'DisplayName', sprintf('Source %d', src));
@@ -610,16 +659,17 @@ function [theta_deg, beam_pattern, fig_handle] = plot_beam_pattern(...
     ax.FontName = 'Times New Roman';
     ax.FontSize = 12;
     
-    % Display beam width statistics
+    % Display beam pattern statistics
     fprintf('\n<strong>Beam Pattern Statistics:</strong>\n');
-    fprintf('  Peak response: %.2f dB (at %.1f degrees)\n', 0, theta_deg(beam_pattern == max(beam_pattern)));
+    [~, peak_idx] = max(beam_pattern);
+    fprintf('  Peak response: 0.00 dB at %.1f degrees\n', theta_deg(peak_idx));
     
     % Calculate -3 dB beamwidth
     threshold_3db = max(beam_pattern) - 3;
     above_threshold = beam_pattern >= threshold_3db;
     
-    % Find contiguous regions above threshold (ensure column vector)
-    above_threshold = above_threshold(:); % Force to column vector
+    % Find contiguous regions above threshold
+    above_threshold = above_threshold(:);
     diff_threshold = diff([0; above_threshold; 0]);
     starts = find(diff_threshold == 1);
     ends = find(diff_threshold == -1) - 1;
@@ -640,17 +690,16 @@ function [theta_deg, beam_pattern, fig_handle] = plot_beam_pattern(...
     
     % Calculate sidelobe level
     main_lobe_mask = beam_pattern >= threshold_3db;
-    main_lobe_mask = main_lobe_mask(:); % Force to column vector
+    main_lobe_mask = main_lobe_mask(:);
     if any(~main_lobe_mask)
-        beam_pattern_col = beam_pattern(:); % Also force beam_pattern to column
+        beam_pattern_col = beam_pattern(:);
         sidelobe_level = max(beam_pattern_col(~main_lobe_mask));
         fprintf('  Maximum sidelobe level: %.2f dB\n', sidelobe_level);
     end
     
-    % Calculate directivity index 
-    % DI = 10*log10(4*pi / integral(pattern^2 dOmega))
-    beam_linear = 10.^(beam_pattern(:)/10); % Force to column vector
-    theta_rad_col = theta_rad(:); % Force to column vector
+    % Calculate directivity index
+    beam_linear = 10.^(beam_pattern(:)/10);
+    theta_rad_col = theta_rad(:);
     integral_val = trapz(theta_rad_col, beam_linear);
     DI = 10*log10(2*pi / integral_val);
     fprintf('  Directivity Index: %.2f dB\n', DI);

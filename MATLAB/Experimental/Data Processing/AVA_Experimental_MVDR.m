@@ -1,40 +1,36 @@
 clc; clear all; close all;
 
-% L Marshall 01/12/2025
+% L Marshall 18/12/2025
 % Variable Number of Sources Localisation via an Acoustic Vector Array
 
-% DAS (Delay-and-Sum) method of beamforming
+% MVDR method of beamforming
 % Using broadband analysis with spectrum blocks
-% Intensity-based beamforming with pressure and particle velocity
-% Supports dual independent arrays with superimposed localisation
+% with eigenvalue decomposition, adaptive regularisation, and weighted MVDR
 
-%also works with singular array
+% SCRIPT ADAPTED FOR EXPERIMENTAL CONFIGURATIONS
 
 %% DEFINE INPUT VARIABLES %%
 
-csv_filename = 'generatedsignal_avs.csv';
+% Input file parameters
+wav_filename = 'your_recording.wav'; 
+csv_filename = 'AVA_Experimental.csv'; % Output CSV file name
+convert_wav_to_csv = true;
 
 % Physical Environment Parameters
 c_0 = 340; %Speed of sound (m/s)
 rho_0 = 1.02; %Air density at STP
 
-% Visualisation Parameters
-% Source positions [x, y, z] (m)
+% Visualisation Parameters (for reference only)
+% Source positions [x, y, z] (m) - expected source location
 source_positions = [
     0, -0.25, 0; %Source 1
     %4, -2, 0.0; %Source 2
 ];
 
-% Source frequencies (Hz)
+% Source frequencies (Hz) - expected frequencies
 source_frequencies = [
     1000; %Source 1 freq
     %2000 %Source 2 freq
-];
-
-% Source amplitudes 
-source_amplitudes = [
-    0.01; %Source 1 a
-    %0.01; %Source 2 a
 ];
 
 num_sources = size(source_positions, 1);
@@ -62,6 +58,7 @@ A2_coord = [x_a2; y_a2; z_a2];
 % Sampling Characteristics
 freq_limit = 3000; %Max freq for analysis (Hz)
 overlap = 0.5; %Percentage overlap for sample window (%)
+loading = 1e-4; %Regularisation parameter
 
 % Grid Search Parameters
 x_scan_points = 200; 
@@ -69,48 +66,164 @@ y_scan_points = 200;
 x_margin = 3; %(m)
 y_margin = 2; %(m)
 
-%% LOAD GENERATED SIGNAL FROM CSV %%
-% Data generated in 'VA_Output_WIP.m'
+%% CONVERT WAV TO CSV (if needed) %%
+
+if convert_wav_to_csv
+    fprintf('<strong>Converting WAV to CSV</strong>\n');
+    
+    % Check if WAV file exists
+    if ~exist(wav_filename, 'file')
+        error('WAV file not found: %s', wav_filename);
+    end
+    
+    % Read WAV file
+    fprintf('Reading WAV file: %s\n', wav_filename);
+    [audio_data, sample_rate] = audioread(wav_filename);
+    
+    % Check number of channels
+    [num_samples, num_channels] = size(audio_data);
+    fprintf('  Samples: %d\n', num_samples);
+    fprintf('  Channels: %d\n', num_channels);
+    fprintf('  Sample rate: %d Hz\n', sample_rate);
+    fprintf('  Duration: %.3f seconds\n', num_samples/sample_rate);
+    
+    % Create time vector
+    time_vec = (0:num_samples-1)' / sample_rate;
+    
+    % Combine time and audio data
+    csv_data = [time_vec, audio_data];
+    
+    % Write to CSV
+    fprintf('Writing to CSV: %s\n', csv_filename);
+    writematrix(csv_data, csv_filename);
+    fprintf('Conversion complete!\n\n');
+end
+
+%% MICROPHONE CALIBRATION DATA PROCESSING %%
+
+% Calibration Parameters
+apply_calibration = false; %set to false to disable all corrections
+
+% Signal Conditioning Parameters
+apply_dc_removal = true; %remove DC offset from time-domain signals
+
+% Calculate expected number of microphones
+N_ma = N_v * 4; %Microphones per array
+N_m = N_a * N_ma; %Total microphones across all arrays
+
+% Measured absolute sensitivities (mV/Pa)
+% absolute_sensitivity_mVPa = [
+%     50;  %mic 1
+%     50;  %mic 2
+%     50.0;  %mic 3
+%     50.0;  %mic 4
+%     % 50.7;  %mic 5
+%     % 50.0;  %mic 6
+%     % 48.7;  %mic 7
+%     % 51.6;  %mic 8
+%     % 49.5;  %mic 9
+%     % 50.4;  %mic 10
+%     % 50.1   %mic 11
+% ];
+absolute_sensitivity_mVPa = 50 * ones(N_m, 1); % Default
+
+% Normalise to the mean and calc relative sensitivities
+mean_sensitivity = mean(absolute_sensitivity_mVPa);
+mic_sensitivity = absolute_sensitivity_mVPa / mean_sensitivity; %column vector
+
+fprintf('<strong>Microphone Calibration Processing</strong>\n');
+fprintf('Expected %d microphones (%d arrays × %d vector sensors × 4 mics)\n', ...
+    N_m, N_a, N_v);
+fprintf('Mean absolute sensitivity: %.2f mV/Pa\n', mean_sensitivity);
+fprintf('\nConverting from Absolute to Relative Sensitivity:\n');
+for mic = 1:min(4, length(mic_sensitivity)) % Show first 4
+    fprintf('  Mic %d: %.2f mV/Pa → %.4f (%.1f%% of mean)\n', ...
+        mic, absolute_sensitivity_mVPa(mic), mic_sensitivity(mic), ...
+        mic_sensitivity(mic) * 100);
+end
+if length(mic_sensitivity) > 4
+    fprintf('  ... (%d more microphones)\n', length(mic_sensitivity) - 4);
+end
+
+% Phase offset corrections (radians)
+% (+) vals mean microphone signal is ahead (leading)
+% (-) vals mean microphone signal is behind (lagging)
+% IMPORTANT: Must be column vector to match mic_sensitivity dimensions
+phase_offset = [
+    0;      %mic 1
+    0;   %mic 2
+   0;   %mic 3
+    0;   %mic 4
+   % -0.04;   %mic 5
+   %  0.01;   %mic 6
+   %  0.03;   %mic 7
+   % -0.02;   %mic 8
+   %  0.04;   %mic 9
+   % -0.01;   %mic 10
+   %  0       %mic 11
+];
+
+fprintf('\nPhase offsets: %.4f to %.4f rad (%.2f to %.2f deg)\n', ...
+    min(phase_offset), max(phase_offset), ...
+    rad2deg(min(phase_offset)), rad2deg(max(phase_offset)));
+fprintf('Phase offset mean: %.4f rad (%.2f deg)\n\n', ...
+    mean(phase_offset), rad2deg(mean(phase_offset)));
+
+%% LOAD SIGNAL DATA FROM CSV %%
 
 fprintf('Loading signal data from: %s\n', csv_filename);
 
 if ~exist(csv_filename, 'file')
-    error('Signal file not found: %s\nRun signal generation first.', csv_filename);
+    error('Signal file not found: %s\nRun WAV conversion first.', csv_filename);
 end
 
-data_table = readtable(csv_filename);
-data = table2array(data_table);
-time = data(:,1); %Time vector
+data = readmatrix(csv_filename);
+time = data(:, 1); %time vector
 [numRows, numCols] = size(data);
 
 N = numRows; %Number of samples
-N_ma = N_v * 4; %Microphones per array
-N_m = N_a * N_ma; %Total microphones across both arrays
+Nr = numCols - 1; %Number of microphones in file
 
-fprintf('Loaded %d samples from %d microphones (%d arrays, %d mics each)\n', ...
-    N, N_m, N_a, N_ma);
+fprintf('Loaded %d samples from %d microphones\n', N, Nr);
 
-%% COMBINE SIGNAL COMPONENTS FOR PROCESSING %%
-% Combine monopole and sinusoidal signals for each array separately
+% Verify microphone count
+if Nr ~= N_m
+    warning('Expected %d microphones but found %d in CSV file!', N_m, Nr);
+    fprintf('Adjusting array configuration...\n');
+    % Adjust if needed - or throw error
+end
 
-% Preallocate cell array
+%% EXTRACT MICROPHONE SIGNALS %%
+
+% Extract all microphone signals
+tx_all = data(:, 2:end).'; % transpose: rows = sensors, columns = time samples
+
+fprintf('Signal matrix size: %d microphones × %d time samples\n', size(tx_all, 1), size(tx_all, 2));
+
+%% SIGNAL CONDITIONING %%
+
+if apply_dc_removal
+    fprintf('Removing DC offset from signals...\n');
+    tx_all = tx_all - mean(tx_all, 2); %subtract mean from each microphone signal
+end
+
+%% ORGANIZE SIGNALS BY ARRAY %%
+
+% Preallocate cell array for array signals
 tx_vs_arrays = cell(N_a, 1);
 
-% Process signals
+% Distribute microphone signals to arrays
 for array = 1:N_a
-    tx_vs = zeros(N_ma, N);
+    % Extract microphones for this array
+    start_idx = (array-1)*N_ma + 1;
+    end_idx = array*N_ma;
+    tx_vs_arrays{array} = tx_all(start_idx:end_idx, :);
     
-    for idx_local = 1:N_ma
-        % Calculate column indices in CSV
-        monopole_col = 1 + (array-1)*N_ma + idx_local;
-        sinusoidal_col = 1 + N_m + (array-1)*N_ma + idx_local;
-        % Combine monopole and sinusoidal components
-        tx_vs(idx_local, :) = data(:, monopole_col) + data(:, sinusoidal_col);
-    end
-    tx_vs_arrays{array} = tx_vs;
+    fprintf('  Array %d: Using microphones %d-%d\n', array, start_idx, end_idx);
 end
 
 %% ARRAY GEOMETRY SET UP %%
+
 % Combine array centres 
 array_centres = [A1_coord, A2_coord];
 
@@ -144,6 +257,7 @@ if N_a > 1
 end
 
 %% CONVERT TO FREQUENCY DOMAIN %%
+
 fprintf('Converting to frequency domain...\n');
 
 d_t = time(2) - time(1); %Time step (s)
@@ -152,10 +266,6 @@ f = F_s * (0:floor(N/2)) / N; %Frequency vector
 
 % Limit frequency range
 idx_limit = f <= freq_limit;
-
-% Store time-domain signals in cell array for looping
-% tx_vs_arrays_time = {tx_vs_arrays{1}, tx_vs_arrays{2}};
-tx_vs_arrays_time = tx_vs_arrays;
 
 % Preallocate FFT storage
 tx_freq_arrays = cell(N_a, 1);
@@ -175,7 +285,7 @@ for array = 1:N_a
     % Process each sensor in this array
     for sensor = 1:N_ma
         % FFT of each sensor signal
-        Y = fft(tx_vs_arrays_time{array}(sensor, :));
+        Y = fft(tx_vs_arrays{array}(sensor, :));
         Y = Y(1:floor(N/2)+1); %Keep positive freqs (complex)
         
         % Store only the useful freqs (<= freq_limit)
@@ -199,25 +309,25 @@ for array = 1:N_a
     set(gca, 'FontName', 'Times New Roman', 'FontSize', 14);
 end
 
-
 %% DEFINING THE GRID SEARCH AREA %%
 
 fprintf('Defining search area...\n');
 
-% Calculate centroid of arrays for grid centering
+% Calculate centroid of arrays for grid centring
 x_arrays_mean = mean(array_centres(1, :));
 y_arrays_mean = mean(array_centres(2, :));
 
-if N_a > 1
+if N_a == 1
+    x_scan = linspace(x_a1 - x_margin, x_a1 + x_margin, x_scan_points);
+    y_scan = linspace(y_a1 - y_margin, y_a1 + y_margin, y_scan_points);
+    z_scan = 0; %2D plane, change if needed
+else
     % Use array mean as grid centre
     x_scan = linspace(x_arrays_mean - x_margin, x_arrays_mean + x_margin, x_scan_points);
     y_scan = linspace(y_arrays_mean - y_margin, y_arrays_mean + y_margin, y_scan_points);
-    z_scan = 0;  %2D plane change if needed
-else
-    x_scan = linspace(x_a1 - x_margin, x_a1 + x_margin, x_scan_points);
-    y_scan = linspace(y_a1 - y_margin, y_a1 + y_margin, y_scan_points);
-    z_scan = 0;  %2D plane change if needed
+    z_scan = 0; %2D plane, change if needed
 end
+
 [X_grid, Y_grid] = meshgrid(x_scan, y_scan);
 Z_grid = zeros(size(X_grid));
 
@@ -236,7 +346,7 @@ fprintf('Search grid: %d x %d points, resolution: %.4f m\n', ...
 
 fprintf('Creating frequency bins...\n');
 
-% Maximum bin width for req spatial resolution
+% Maximum bin width for required spatial resolution
 max_binwidth = 1/(8*d_y*(N_ma-1)/c_0); %(Hz)
 size_fft = floor(F_s/max_binwidth);
 
@@ -245,7 +355,6 @@ delta_f = F_s / N; %Frequency spacing per bin
 fft_vec = F_s * (0:(size_fft-1)) / size_fft; %Freq vector
 
 % Target frequencies
-% Step in terms of FFT bins
 min_freq = max_binwidth;
 target_freqs = min_freq:max_binwidth:freq_limit;
 
@@ -264,7 +373,7 @@ num_bins = length(bin_index); %No. bins
 fprintf('Using %d frequency bins (%.1f - %.1f Hz)\n', ...
     num_bins, min(bin_freqs), max(bin_freqs));
 
-num_snaps = 4*N_m; %No. snapshots
+num_snaps = 8*N_m; %No. snapshots
 
 % Calc no. samples accounting for overlap
 num_samps = (num_snaps+1)*size_fft*overlap;
@@ -284,6 +393,18 @@ for array = 1:N_a
     snapshots_vs_arrays{array} = make_snapshots(tx_vs_arrays{array}, size_fft, overlap, window);
     fprintf('  Array %d: Created %d snapshots\n', array, size(snapshots_vs_arrays{array}, 3));
     
+    % Apply calibration corrections if enabled
+    if apply_calibration
+        fprintf('  Array %d: Applying calibration corrections...\n', array);
+        % Extract sensitivity and phase for this array's mics
+        start_idx = (array-1)*N_ma + 1;
+        end_idx = array*N_ma;
+        mic_sens_array = mic_sensitivity(start_idx:end_idx);
+        phase_offset_array = phase_offset(start_idx:end_idx);
+        snapshots_vs_arrays{array} = apply_calibration_correction(...
+            snapshots_vs_arrays{array}, mic_sens_array, phase_offset_array);
+    end
+    
     % Create cross-spectral matrix
     r_vs_arrays{array} = create_vs_csm(snapshots_vs_arrays{array}, bin_index, delta, ...
                                         bin_freqs, rho_0, N_v, num_bins, c_0);
@@ -291,9 +412,10 @@ for array = 1:N_a
             array, size(r_vs_arrays{array}));
 end
 
-%% PERFORM DAS BEAMFORMING %%
+%% PERFORM MVDR BEAMFORMING %%
 
-fprintf('\n<strong>Running DAS Beamforming...</strong>\n');
+fprintf('\n<strong>Running MVDR Beamforming...</strong>\n');
+fprintf('  Regularisation parameter: %.2e\n', loading);
 
 % Calculate beamforming response for each array separately
 response_db_arrays = cell(N_a, 1);
@@ -301,8 +423,9 @@ response_db_arrays = cell(N_a, 1);
 fprintf('\nCalculating individual array responses:\n');
 for array = 1:N_a
     fprintf('  Processing Array %d...\n', array);
-    response_db_arrays{array} = das_vs_beamforming(r_vs_arrays{array}, ...
-        vs_centres_arrays{array}, candidate_points, bin_freqs, c_0, rho_0, num_bins, N_v);
+    response_db_arrays{array} = mvdr_vs_beamforming(r_vs_arrays{array}, ...
+        vs_centres_arrays{array}, candidate_points, bin_freqs, c_0, rho_0, ...
+        loading, num_bins, N_v);
     fprintf('    Array %d response range: [%.2f, %.2f] dB\n', array, ...
         min(response_db_arrays{array}), max(response_db_arrays{array}));
 end
@@ -311,29 +434,29 @@ end
 fprintf('\n2D Scans - Individual Arrays:\n');
 for array = 1:N_a
     fprintf('  Plotting Array %d response...\n', array);
-    [~, ~] = plot_2dscan_das(r_vs_arrays{array}, vs_centres_arrays{array}, ...
+    [~, ~] = plot_2dscan_mvdr(r_vs_arrays{array}, vs_centres_arrays{array}, ...
         candidate_points, bin_freqs, c_0, rho_0, y_scan, x_scan, ...
-        X_grid, Y_grid, num_bins, N_v, num_sources, source_positions, ...
+        X_grid, Y_grid, loading, num_bins, N_v, num_sources, source_positions, ...
         response_db_arrays{array}, array);
 end
 
 if N_a > 1
     % Superimpose responses via multiplication (intersection method)
     fprintf('\nCombining array responses...\n');
-    
+
     % Convert from dB to linear and multiply responses
     response_linear_combined = 1; %Identity for multiplication
     for k = 1:N_a
         response_linear_combined = response_linear_combined .* 10.^(response_db_arrays{k}/10);
     end
-    
+
     % Convert back to dB and normalise
     response_db_combined = 10*log10(response_linear_combined + eps);
     response_db_combined = response_db_combined - max(response_db_combined);
-    
+
     fprintf('  Combined response range: [%.2f, %.2f] dB\n', ...
         min(response_db_combined), max(response_db_combined));
-    
+
     % Plot combined response and find source positions
     fprintf('  Plotting superimposed response and localising sources...\n');
     [est_positions_combined, scan_2d_max_db] = ...
@@ -502,25 +625,17 @@ end
 radius = median(distances_all);
 fprintf('Using radius = %.3f m (median source distance across all arrays)\n', radius);
 
-% Store beam patterns for testing
-beam_patterns_storage = cell(N_a, 1);
-theta_deg_storage = [];
-
 % For individual arrays
 for array = 1:N_a
     array_centre_2d = vs_centres_arrays{array}(1:2, 1);
-    [theta_deg, beam_pattern, fig_handle] = beam_pattern_das(...
+    [theta_deg, beam_pattern, fig_handle] = compute_nearfield_beam_pattern(...
         r_vs_arrays{array}, vs_centres_arrays{array}, array_centre_2d, ...
-        source_positions(:,1:2), bin_freqs, c_0, rho_0, num_bins, N_v, ...
-        radius, sprintf('Array %d Near-Field Beam Pattern (DAS)', array));
-    
-    beam_patterns_storage{array} = beam_pattern;
-    theta_deg_storage = theta_deg;
-    theta_rad = deg2rad(theta_deg);
+        source_positions(:,1:2), bin_freqs, c_0, rho_0, loading, num_bins, N_v, ...
+        radius, sprintf('Array %d Near-Field Beam Pattern', array));
 end
 
 if N_a > 1
-    % For superimposed response, combine CSMs
+    % For superimposed response, need to combine CSMs first
     fprintf('\nComputing beam pattern for superimposed arrays...\n');
     
     % Use midpoint of array centres as reference
@@ -541,36 +656,41 @@ if N_a > 1
     
     % Compute beam pattern for combined system
     N_v_combined = N_v * N_a;
-    [theta_deg, beam_pattern, fig_handle] = beam_pattern_das(...
+    [theta_deg, beam_pattern, fig_handle] = compute_nearfield_beam_pattern(...
         r_vs_combined, vs_centres_combined, reference_centre, ...
-        source_positions(:,1:2), bin_freqs, c_0, rho_0, num_bins, ...
-        N_v_combined, radius, 'Superimposed Near-Field Beam Pattern (DAS)');
+        source_positions(:,1:2), bin_freqs, c_0, rho_0, loading, num_bins, ...
+        N_v_combined, radius, 'Superimposed Near-Field Beam Pattern');
 end
 
 %% FUNCTION DEFINITIONS %%
 
 % FUNCTION: MAKE SNAPSHOTS OF GENERATED SIGNAL
-% Make time domain snapshots of input signal
-function snapshots = make_snapshots(tx, size_fft, overlap, window)
-    % No. samples to move per snapshot
-    step = round(overlap*size_fft);
-    
-    % No. of full snapshots that fit in signal with given step size
-    num_snap = floor((size(tx,2)-size_fft)/step)+1; %No. snapshots 
-    % Start indices for each snapshot
-    start_idx = 1+(0:(num_snap-1))*step;
-    
-    % Create index matrix (size_fft x num_snap)
-    idx_matrix = start_idx+(0:size_fft-1)';  %Each column = indices for a snapshot
-    
-    % Extract snapshots (force reshape into 3D)
-    snapshots = tx(:, idx_matrix);  
-    snapshots = reshape(snapshots, size(tx,1), size_fft, num_snap);
-    
-    % Apply window along snapshots dimension
-    snapshots = snapshots.*reshape(window, [1, size_fft, 1]);
+function snapshots = make_snapshots(tx_vs, size_fft, overlap, window)
+    step = round(overlap * size_fft);
+    num_snap = floor((size(tx_vs,2) - size_fft) / step) + 1;
+    start_idx = 1 + (0:(num_snap-1)) * step;
+    idx_matrix = start_idx + (0:size_fft-1)';
+    snapshots = tx_vs(:, idx_matrix);
+    snapshots = reshape(snapshots, size(tx_vs,1), size_fft, num_snap);
+    snapshots = snapshots .* reshape(window, [1, size_fft, 1]);
 end
 
+% FUNCTION: APPLY CALIBRATION CORRECTIONS
+function snapshots_corrected = apply_calibration_correction(snapshots, mic_sensitivity, phase_offset)  
+    N_mics = size(snapshots, 1);
+    
+    % FFT each snapshot to frequency domain
+    snapshots_freq = fft(snapshots, [], 2);
+    
+    % Create correction factors for each microphone
+    correction_factors = (1 ./ mic_sensitivity) .* exp(-1i * phase_offset);
+    correction_factors = reshape(correction_factors, [N_mics, 1, 1]); 
+    
+    % Apply corrections
+    snapshots_freq_corrected = snapshots_freq .* correction_factors; 
+    snapshots_corrected = ifft(snapshots_freq_corrected, [], 2);
+    snapshots_corrected = real(snapshots_corrected);
+end
 
 % FUNCTION: CREATE CROSS-SPECTRAL MATRIX FOR VECTOR SENSOR ARRAY
 % Convert 4-mic snapshots to pressure and velocity, then create CSM
@@ -616,55 +736,65 @@ function r_vs = create_vs_csm(snapshots_vs, bin_index, delta, bin_freqs, rho_0, 
 end
 
 
-% FUNCTION: DAS BEAMFORMING FOR VECTOR SENSOR ARRAY
-function response_db = das_vs_beamforming(r_vs, vs_centres, candidate_points, ...
-    bin_freqs, c_0, rho_0, num_bins, N_v)
+% FUNCTION: MVDR BEAMFORMING FOR VECTOR SENSOR ARRAY
+function response_db = mvdr_vs_beamforming(r_vs, vs_centres, candidate_points, ...
+    bin_freqs, c_0, rho_0, loading, num_bins, N_v)
     
     num_points = size(candidate_points, 1);
-    das_responses = zeros(num_points, num_bins);
+    mvdr_responses = zeros(num_points, num_bins);
     
     for jf = 1:num_bins 
         freq = bin_freqs(jf);
         rf = squeeze(r_vs(:,:,jf)); %Covariance matrix for this freq bin
+        % Eigenvalue decomposition (improve stability)
+        [ur, er] = eig(rf);
+        erv = real(diag(er));
+        % Safety check for negative eigenvalues 
+        erv = max(erv, 1e-12);
         
         for n = 1:num_points
             source_pos = candidate_points(n,:).';
             % Create VS steering vector
             v_vs = vs_steering_vector(vs_centres, source_pos, freq, c_0, rho_0, N_v);
             
-            % Normalise steering vector to prevent 1/r divergence
-            v_vs = v_vs / sqrt(v_vs' * v_vs);
-
-            % DAS beamforming: output power = v^H * R * v
-            das_responses(n, jf) = abs(v_vs' * rf * v_vs);
+            % Adaptive regularisation
+            lambda = loading * max(erv); %lambda = diagonal loading factor
+            % Weighted MVDR using eigendecomposition
+            rxv = (ur * diag(1./(erv + lambda)) * ur') * v_vs;
+            denominator = v_vs' * rxv; %Normalise to get weight vector
+            
+            if abs(denominator) > 1e-12
+                vmvdr = rxv / denominator;
+                % Calc weighted output power
+                mvdr_responses(n, jf) = abs(vmvdr' * rf * vmvdr);
+            end
         end
     end
-    
-    % Sum across frequencies for broadband response
-    responses_sum = sum(das_responses, 2);
+    % Sum across frequencies
+    responses_sum = sum(mvdr_responses, 2);
     response_db = 10*log10(responses_sum + eps);
     response_db = response_db - max(response_db);
 end
 
 
-% FUNCTION: 2D SCAN PLOTTING FOR DAS
-function [all_est_positions, scan_2d_max_db] = plot_2dscan_das(r_vs, vs_centres, ...
-    candidate_points, bin_freqs, c_0, rho_0, y_scan, x_scan, X_grid, Y_grid, ...
-    num_bins, N_v, num_sources, source_positions, response_db, array_num)
+% FUNCTION: 2D SCAN PLOTTING FOR MVDR
+function [all_est_positions, scan_2d_max_db] = plot_2dscan_mvdr(...
+    r_vs, vs_centres, candidate_points, bin_freqs, c_0, rho_0, y_scan, x_scan, ...
+    X_grid, Y_grid, loading, num_bins, N_v, num_sources, source_positions, response_db, array_num)
     
     % If response_db not provided, calculate it
-    if nargin < 15
-        response_db = das_vs_beamforming(r_vs, vs_centres, candidate_points, ...
-            bin_freqs, c_0, rho_0, num_bins, N_v);
+    if nargin < 16
+        response_db = mvdr_vs_beamforming(r_vs, vs_centres, candidate_points, ...
+            bin_freqs, c_0, rho_0, loading, num_bins, N_v);
         array_num = 1; %Default to array 1
-    elseif nargin < 16
+    elseif nargin < 17
         array_num = 1; %Default if not specified
     end
     
     % Reshape responses to a grid for plotting
     grid_response = reshape(response_db, length(y_scan), length(x_scan));
     
-    figure('Name', sprintf('Array %d: 2D DAS Beamforming', array_num));
+    figure('Name', sprintf('Array %d: 2D MVDR Beamforming', array_num));
     imagesc(x_scan, y_scan, grid_response);
     axis xy;
     xlabel('X (m)', 'FontName', 'Times New Roman', 'FontSize', 14);
@@ -682,7 +812,7 @@ function [all_est_positions, scan_2d_max_db] = plot_2dscan_das(r_vs, vs_centres,
     search_radius_x = 0.5;
     search_radius_y = 0.5;
     
-    source_colors = lines(num_sources);
+    source_colours = lines(num_sources);
     
     for src = 1:num_sources
         true_x = source_positions(src, 1);
@@ -704,54 +834,19 @@ function [all_est_positions, scan_2d_max_db] = plot_2dscan_das(r_vs, vs_centres,
         all_est_positions(src,:) = [est_x_src, est_y_src];
         
         % Plot true source position
-        plot(true_x, true_y, 'x', 'Color', source_colors(src,:), ...
+        plot(true_x, true_y, 'x', 'Color', source_colours(src,:), ...
             'MarkerSize', 14, 'LineWidth', 3, ...
             'DisplayName', sprintf('True Source %d', src));
         
         % Plot estimated position
-        plot(est_x_src, est_y_src, 'o', 'Color', source_colors(src,:), ...
+        plot(est_x_src, est_y_src, 'o', 'Color', source_colours(src,:), ...
             'MarkerSize', 12, 'LineWidth', 2, 'MarkerFaceColor', 'none', ...
             'DisplayName', sprintf('Est Source %d', src));
     end
     
     legend('Location', 'northeast', 'Color', 'w', 'TextColor', 'k');
     set(gca, 'FontName', 'Times New Roman', 'FontSize', 12);
-    title(sprintf('Array %d: DAS Beamforming (%d Sources)', array_num, num_sources), ...
-        'FontName', 'Times New Roman', 'FontSize', 14);
-end
-
-
-% FUNCTION: 1D SCAN PLOTTING FOR DAS
-function [max_response, y_est] = plot_1dscan_das(r_vs, vs_centres, source_y, ...
-    bin_freqs, c_0, rho_0, num_bins, N_v, x_fixed, src_num)
-    
-    y_scan_line = linspace(source_y-2, source_y+2, 200);
-    z_fixed = 0;
-    
-    candidate_points_line = [x_fixed*ones(length(y_scan_line),1), ...
-        y_scan_line(:), z_fixed*ones(length(y_scan_line),1)];
-    
-    response_line = das_vs_beamforming(r_vs, vs_centres, ...
-        candidate_points_line, bin_freqs, c_0, rho_0, num_bins, N_v);
-    
-    [max_response, max_idx] = max(response_line);
-    y_est = y_scan_line(max_idx);
-    
-    fprintf('  Max response: %.2f dB at y = %.3f m\n', max_response, y_est);
-    
-    figure('Name', sprintf('1D DAS Scan - Source %d', src_num));
-    plot(y_scan_line, response_line, 'LineWidth', 2);
-    xlabel('y position (m)', 'FontName', 'Times New Roman', 'FontSize', 14);
-    ylabel('Beamformer Response (dB)', 'FontName', 'Times New Roman', 'FontSize', 14);
-    grid on;
-    hold on;
-    
-    plot(source_y, max(response_line), 'kx', 'MarkerSize', 10, 'LineWidth', 1.5);
-    xline(source_y, 'r--', 'LineWidth', 1.5, 'DisplayName', 'True Source');
-    
-    legend('Beamformer Response', 'True Source');
-    set(gca, 'FontName', 'Times New Roman', 'FontSize', 14);
-    title(sprintf('Source %d: 1D DAS Scan at x = %.2f m', src_num, x_fixed), ...
+    title(sprintf('Array %d: MVDR Beamforming (%d Sources)', array_num, num_sources), ...
         'FontName', 'Times New Roman', 'FontSize', 14);
 end
 
@@ -777,7 +872,7 @@ function [all_est_positions, max_db] = ...
     source_colours = lines(num_sources);
     
     % Create combined response plot
-    figure('Name', sprintf('Superimposed DAS (%d Arrays)', N_a));
+    figure('Name', sprintf('Superimposed MVDR (%d Arrays)', N_a));
     imagesc(x_scan, y_scan, grid_response);
     axis xy;
     xlabel('X (m)', 'FontName', 'Times New Roman', 'FontSize', 14);
@@ -904,13 +999,13 @@ function v_vs = vs_steering_vector(vs_centres, source_pos, freq, c_0, rho_0, N_v
     end
 end
 
-% FUNCTION: COMPUTE NEAR-FIELD BEAM PATTERN FOR DAS
-% Compute proper beam pattern by evaluating DAS response at each angle
-function [theta_deg, beam_pattern, fig_handle] = beam_pattern_das(...
+% FUNCTION: COMPUTE NEAR-FIELD BEAM PATTERN
+% Compute proper beam pattern by evaluating MVDR response at each angle
+function [theta_deg, beam_pattern, fig_handle] = compute_nearfield_beam_pattern(...
     r_vs, vs_centres, array_centre, source_positions, bin_freqs, c_0, rho_0, ...
-    num_bins, N_v, radius, plot_title)
+    loading, num_bins, N_v, radius, plot_title)
     
-    fprintf('\n<strong>Computing Near-Field Beam Pattern (DAS):</strong>\n');
+    fprintf('\n<strong>Computing Near-Field Beam Pattern:</strong>\n');
     fprintf('  Range: %.3f m\n', radius);
     fprintf('  Array centre: (%.3f, %.3f) m\n', array_centre);
     
@@ -921,12 +1016,20 @@ function [theta_deg, beam_pattern, fig_handle] = beam_pattern_das(...
     theta_rad = deg2rad(theta_deg);
     
     % Initialise beam pattern storage
-    das_responses = zeros(num_angles, num_bins);
+    mvdr_responses = zeros(num_angles, num_bins);
     
-    % Compute DAS response for each angle and frequency
+    % Compute MVDR response for each angle and frequency
     for jf = 1:num_bins
         freq = bin_freqs(jf);
         rf = squeeze(r_vs(:,:,jf)); % Covariance matrix for this frequency bin
+        
+        % Eigenvalue decomposition for stability
+        [ur, er] = eig(rf);
+        erv = real(diag(er));
+        erv = max(erv, 1e-12); % Safety check for negative eigenvalues
+        
+        % Adaptive regularisation parameter (matching your existing code)
+        lambda = loading * max(erv);
         
         % For each angular direction
         for angle_idx = 1:num_angles
@@ -939,21 +1042,23 @@ function [theta_deg, beam_pattern, fig_handle] = beam_pattern_das(...
             % Create steering vector for this direction
             v_vs = vs_steering_vector(vs_centres, source_pos, freq, c_0, rho_0, N_v);
             
-            % Normalise steering vector to prevent 1/r divergence
-            v_vs = v_vs / sqrt(v_vs' * v_vs);
+            % Weighted MVDR using eigendecomposition 
+            rxv = (ur * diag(1./(erv + lambda)) * ur') * v_vs;
+            denominator = v_vs' * rxv;
             
-            % DAS beamforming: output power = v^H * R * v
-            das_responses(angle_idx, jf) = abs(v_vs' * rf * v_vs);
+            if abs(denominator) > 1e-12
+                vmvdr = rxv / denominator;
+                mvdr_responses(angle_idx, jf) = abs(vmvdr' * rf * vmvdr);
+            else
+                mvdr_responses(angle_idx, jf) = 0;
+            end
         end
         
-        if mod(jf, 10) == 0 || jf == num_bins
-            fprintf('  Processed %d/%d frequency bins\r', jf, num_bins);
-        end
     end
     fprintf('\n');
     
     % Sum across frequencies for broadband response
-    beam_pattern_linear = sum(das_responses, 2);
+    beam_pattern_linear = sum(mvdr_responses, 2);
     
     % Convert to dB and normalise
     beam_pattern = 10*log10(beam_pattern_linear + eps);

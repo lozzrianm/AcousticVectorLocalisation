@@ -15,14 +15,14 @@ Q_o = 0.01; %source amplitude
 f = 1000; %source frequency (Hz)
 
 % Source Position
-x_s = 0; %source x coordinate (m)
-y_s = -0.25; %source y coordinate (m)
+x_s = -1; %source x coordinate (m)
+y_s = 0; %source y coordinate (m)
 z_s = 0; %source z coordinate (m)
 
 % Array Parameters
-N_mics = 11; %number of microphones
+N_mics = 4; %number of microphones
 d_y = 0.08; %spacing between array elements (m)
-x_a = 2; %array centre x coordinate (m)
+x_a = 0; %array centre x coordinate (m)
 z_a = 0; %array centre z coordinate (m)
 
 % Physical Environment Parameters
