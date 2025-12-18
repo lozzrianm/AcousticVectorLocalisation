@@ -485,6 +485,23 @@ end
 % Store results for backward compatibility
 all_results = all_cases_results{end};
 
+% %% BEAM PATTERN ANALYSIS %%
+% fprintf('\n<strong>GENERATING BEAM PATTERNS</strong>\n');
+% 
+% % For individual arrays
+% for array = 1:N_a
+%     array_centre = vs_centres_arrays{array}(1:2, 1);
+%     plot_beam_pattern(response_db_arrays{array}, X_grid, Y_grid, ...
+%         array_centre, sprintf('Array %d Beam Pattern', array), source_positions(:,1:2));
+% end
+% 
+% if N_a > 1
+%     % For superimposed response
+%     reference_centre = mean(array_centres(1:2, :), 2);
+%     plot_beam_pattern(response_db_combined, X_grid, Y_grid, ...
+%         reference_centre, 'Superimposed Beam Pattern', source_positions(:,1:2));
+% end
+
 %% BEAM PATTERN ANALYSIS %%
 fprintf('\n<strong>GENERATING BEAM PATTERNS</strong>\n');
 
@@ -899,7 +916,7 @@ function [theta_deg, beam_pattern, fig_handle] = compute_nearfield_beam_pattern(
         % For each angular direction
         for angle_idx = 1:num_angles
             % Calculate source position at this angle and range
-            % 0deg is along +Y axis (North), increases clockwise
+            % 0° is along +Y axis (North), increases clockwise
             x_pos = array_centre(1) + radius * sin(theta_rad(angle_idx));
             y_pos = array_centre(2) + radius * cos(theta_rad(angle_idx));
             source_pos = [x_pos; y_pos; 0];
@@ -907,12 +924,13 @@ function [theta_deg, beam_pattern, fig_handle] = compute_nearfield_beam_pattern(
             % Create steering vector for this direction
             v_vs = vs_steering_vector(vs_centres, source_pos, freq, c_0, rho_0, N_v);
             
-            % Weighted MVDR using eigendecomposition 
+            % Weighted MVDR using eigendecomposition (matching your existing code)
             rxv = (ur * diag(1./(erv + lambda)) * ur') * v_vs;
             denominator = v_vs' * rxv;
             
             if abs(denominator) > 1e-12
                 vmvdr = rxv / denominator;
+                % Use same formulation as your mvdr_vs_beamforming function
                 mvdr_responses(angle_idx, jf) = abs(vmvdr' * rf * vmvdr);
             else
                 mvdr_responses(angle_idx, jf) = 0;
@@ -943,7 +961,7 @@ function [theta_deg, beam_pattern, fig_handle] = compute_nearfield_beam_pattern(
     rticks(rticks_vals);
     rticklabels(arrayfun(@(x) sprintf('%.1f dB', x), rticks_vals, 'UniformOutput', false));
     
-    % Add source positions
+    % Add source positions if provided
     if ~isempty(source_positions)
         hold on;
         for src = 1:size(source_positions, 1)
