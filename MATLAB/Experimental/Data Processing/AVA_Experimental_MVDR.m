@@ -6,14 +6,15 @@ clc; clear all; close all;
 % MVDR method of beamforming
 % Using broadband analysis with spectrum blocks
 % with eigenvalue decomposition, adaptive regularisation, and weighted MVDR
+% utilises null search method for multiple sources
 
 % SCRIPT ADAPTED FOR EXPERIMENTAL CONFIGURATIONS
 
 %% DEFINE INPUT VARIABLES %%
 
 % Input file parameters
-wav_filename = 'your_recording.wav'; 
-csv_filename = 'AVA_Experimental.csv'; % Output CSV file name
+wav_filename = '20251218-031707(UTC)-MEMSTrial21812-0770169790.wav'; 
+csv_filename = 'AVA_MEMSTrial2_1812.csv'; % Output CSV file name
 convert_wav_to_csv = true;
 
 % Physical Environment Parameters
@@ -23,13 +24,13 @@ rho_0 = 1.02; %Air density at STP
 % Visualisation Parameters (for reference only)
 % Source positions [x, y, z] (m) - expected source location
 source_positions = [
-    0, -0.25, 0; %Source 1
+    -1, 0, 0; %Source 1
     %4, -2, 0.0; %Source 2
 ];
 
 % Source frequencies (Hz) - expected frequencies
 source_frequencies = [
-    1000; %Source 1 freq
+    1500; %Source 1 freq
     %2000 %Source 2 freq
 ];
 
@@ -39,12 +40,14 @@ num_sources = size(source_positions, 1);
 N_a = 1; %Number of independent arrays
 N_v = 1; %No. of vector sensors per array
 d_y = 0.1; %Vector sensor y axis spacing (m)
-delta = 0.0425; %MEMS colocation spacing (m)
+delta = 0.042; %MEMS colocation spacing (m)
 
 % Array centre geom 1
-x_a1 = 2.0 + delta/2; % Geometric centre x-coordinate
+% x_a1 = 0 + delta/2; 
+x_a1 = 0; % Geometric centre x-coordinate
 z_a1 = 0; % Array centre z-coordinate
-y_a1 = -d_y/2 + delta/2; % Geometric centre y-coordinate
+y_a1 = 0; % Geometric centre y-coordinate
+% y_a1 = -d_y/2 + delta/2; 
 A1_coord = [x_a1; y_a1; z_a1];
 
 % Array centre geom 2
@@ -199,6 +202,7 @@ end
 tx_all = data(:, 2:end).'; % transpose: rows = sensors, columns = time samples
 
 fprintf('Signal matrix size: %d microphones × %d time samples\n', size(tx_all, 1), size(tx_all, 2));
+
 
 %% SIGNAL CONDITIONING %%
 
@@ -412,6 +416,7 @@ for array = 1:N_a
             array, size(r_vs_arrays{array}));
 end
 
+
 %% PERFORM MVDR BEAMFORMING %%
 
 fprintf('\n<strong>Running MVDR Beamforming...</strong>\n');
@@ -487,6 +492,12 @@ end
 num_cases = length(responses_to_analyse);
 all_cases_results = cell(num_cases, 1);
 
+% Calculate minimum source separation for spatial nulling
+min_separation = max([0.25, 3*grid_res]); %At least 3 grid points or 0.25m
+if num_sources > 1
+    fprintf('Minimum source separation for multi-source detection: %.3f m\n', min_separation);
+end
+
 % Analyse each case
 for case_idx = 1:num_cases
     fprintf('\n<strong>%s:</strong>\n', response_names{case_idx});
@@ -505,27 +516,31 @@ for case_idx = 1:num_cases
                      'angular_error', zeros(num_sources, 1), ...
                      'peak_response', zeros(num_sources, 1));
     
+    % Find source positions with spatial nulling
+    est_positions = zeros(num_sources, 2);
+    peak_responses = zeros(num_sources, 1);
+    response_work = grid_response;
+    
+    for src = 1:num_sources
+        % Find current global maximum
+        [peak_responses(src), max_idx] = max(response_work(:));
+        [y_idx, x_idx] = ind2sub(size(grid_response), max_idx);
+        est_positions(src, :) = [X_grid(y_idx, x_idx), Y_grid(y_idx, x_idx)];
+        
+        % Null spatial region around detected peak (for multi-source)
+        if num_sources > 1 && src < num_sources
+            distances = sqrt((X_grid - est_positions(src,1)).^2 + (Y_grid - est_positions(src,2)).^2);
+            response_work(distances < min_separation) = -Inf;
+        end
+    end
+    
     % Process each source
     for src = 1:num_sources
         fprintf('  <strong>SOURCE %d: (%.3f, %.3f) m @ %.0f Hz</strong>\n', ...
             src, source_positions(src, 1:2), source_frequencies(src));
         
-        % Define search region
         true_pos = source_positions(src, 1:2);
-        search_radius = [0.5, 0.5]; % [x, y] search radius (m)
-        
-        % Create search mask
-        region_mask = (X_grid >= true_pos(1) - search_radius(1)) & ...
-                     (X_grid <= true_pos(1) + search_radius(1)) & ...
-                     (Y_grid >= true_pos(2) - search_radius(2)) & ...
-                     (Y_grid <= true_pos(2) + search_radius(2));
-        
-        % Find peak in search region
-        region_response = grid_response;
-        region_response(~region_mask) = -Inf;
-        [max_val, max_idx] = max(region_response(:));
-        [y_idx, x_idx] = ind2sub(size(grid_response), max_idx);
-        est_pos = [X_grid(y_idx, x_idx), Y_grid(y_idx, x_idx)];
+        est_pos = est_positions(src, :);
         
         % Calculate errors
         errors = true_pos - est_pos;
@@ -549,7 +564,7 @@ for case_idx = 1:num_cases
         results.MSE_percent(src) = MSE_percent;
         results.radial_error(src) = radial_error;
         results.angular_error(src) = angular_error_deg;
-        results.peak_response(src) = max_val;
+        results.peak_response(src) = peak_responses(src);
         
         % Display results
         fprintf('  Estimated position: (%.4f, %.4f) m\n', est_pos);
@@ -558,7 +573,7 @@ for case_idx = 1:num_cases
         fprintf('  Mean Squared Error: %.4f m²\n', MSE);
         fprintf('  MSE (normalised): %.3f%% of grid resolution\n', MSE_percent);
         fprintf('  Angular Error: %.3f deg\n', angular_error_deg);
-        fprintf('  Peak Response: %.3f dB\n\n', max_val);
+        fprintf('  Peak Response: %.3f dB\n\n', peak_responses(src));
     end
     
     all_cases_results{case_idx} = results;
@@ -803,35 +818,37 @@ function [all_est_positions, scan_2d_max_db] = plot_2dscan_mvdr(...
     colormap('jet');
     hold on;
     
-    % Find global maximum 
-    [scan_2d_max_db, max_idx] = max(grid_response(:));
-    [y_idx, x_idx] = ind2sub(size(grid_response), max_idx);
+    % Find global maximum for return value
+    [scan_2d_max_db, ~] = max(grid_response(:));
     
-    % Find estimated position for each source
+    % Find estimated positions with spatial nulling
+    grid_res = mean([x_scan(2) - x_scan(1), y_scan(2) - y_scan(1)]);
+    min_separation = max([0.25, 3*grid_res]);
+    
     all_est_positions = zeros(num_sources, 2);
-    search_radius_x = 0.5;
-    search_radius_y = 0.5;
+    response_work = grid_response;
     
+    for src = 1:num_sources
+        % Find current global maximum
+        [~, max_idx] = max(response_work(:));
+        [y_idx, x_idx] = ind2sub(size(grid_response), max_idx);
+        all_est_positions(src, :) = [X_grid(y_idx, x_idx), Y_grid(y_idx, x_idx)];
+        
+        % Null spatial region around detected peak (for multi-source)
+        if num_sources > 1 && src < num_sources
+            distances = sqrt((X_grid - all_est_positions(src,1)).^2 + (Y_grid - all_est_positions(src,2)).^2);
+            response_work(distances < min_separation) = -Inf;
+        end
+    end
+    
+    % Plot all sources
     source_colours = lines(num_sources);
     
     for src = 1:num_sources
         true_x = source_positions(src, 1);
         true_y = source_positions(src, 2);
-        
-        % Define search region around true source
-        x_mask = (X_grid >= true_x - search_radius_x) & (X_grid <= true_x + search_radius_x);
-        y_mask = (Y_grid >= true_y - search_radius_y) & (Y_grid <= true_y + search_radius_y);
-        region_mask = x_mask & y_mask;
-        
-        % Find peak in region
-        region_response = grid_response;
-        region_response(~region_mask) = -Inf;
-        [~, max_idx_src] = max(region_response(:));
-        [y_idx_src, x_idx_src] = ind2sub(size(grid_response), max_idx_src);
-        est_x_src = X_grid(y_idx_src, x_idx_src);
-        est_y_src = Y_grid(y_idx_src, x_idx_src);
-        
-        all_est_positions(src,:) = [est_x_src, est_y_src];
+        est_x_src = all_est_positions(src, 1);
+        est_y_src = all_est_positions(src, 2);
         
         % Plot true source position
         plot(true_x, true_y, 'x', 'Color', source_colours(src,:), ...
@@ -852,7 +869,6 @@ end
 
 
 % FUNCTION: SUPERIMPOSED LOCALISATION
-% Plot combined array response and localise sources
 function [all_est_positions, max_db] = ...
     superimposed_localisation(response_db_combined, X_grid, Y_grid, y_scan, x_scan, ...
     num_sources, source_positions, N_a)
@@ -861,15 +877,27 @@ function [all_est_positions, max_db] = ...
     grid_response = reshape(response_db_combined, length(y_scan), length(x_scan));
     
     % Find global maximum
-    [max_db, max_idx] = max(grid_response(:));
-    [y_idx, x_idx] = ind2sub(size(grid_response), max_idx);
+    [max_db, ~] = max(grid_response(:));
     
-    % Find estimated position for each source
+    % Find estimated positions with spatial nulling
+    grid_res = mean([x_scan(2) - x_scan(1), y_scan(2) - y_scan(1)]);
+    min_separation = max([0.5, 3*grid_res]);
+    
     all_est_positions = zeros(num_sources, 2);
-    search_radius_x = 0.5; %(m)
-    search_radius_y = 0.5; %(m)
+    response_work = grid_response;
     
-    source_colours = lines(num_sources);
+    for src = 1:num_sources
+        % Find current global maximum
+        [~, max_idx] = max(response_work(:));
+        [y_idx, x_idx] = ind2sub(size(grid_response), max_idx);
+        all_est_positions(src, :) = [X_grid(y_idx, x_idx), Y_grid(y_idx, x_idx)];
+        
+        % Null spatial region around detected peak (for multi-source)
+        if num_sources > 1 && src < num_sources
+            distances = sqrt((X_grid - all_est_positions(src,1)).^2 + (Y_grid - all_est_positions(src,2)).^2);
+            response_work(distances < min_separation) = -Inf;
+        end
+    end
     
     % Create combined response plot
     figure('Name', sprintf('Superimposed MVDR (%d Arrays)', N_a));
@@ -881,24 +909,13 @@ function [all_est_positions, max_db] = ...
     colormap('jet');
     hold on;
     
+    source_colours = lines(num_sources);
+    
     for src = 1:num_sources
         true_x = source_positions(src, 1);
         true_y = source_positions(src, 2);
-        
-        % Define search region around this source
-        x_mask = (X_grid >= true_x - search_radius_x) & (X_grid <= true_x + search_radius_x);
-        y_mask = (Y_grid >= true_y - search_radius_y) & (Y_grid <= true_y + search_radius_y);
-        region_mask = x_mask & y_mask;
-        
-        % Find peak in region
-        region_response = grid_response;
-        region_response(~region_mask) = -Inf;
-        [~, max_idx_src] = max(region_response(:));
-        [y_idx_src, x_idx_src] = ind2sub(size(grid_response), max_idx_src);
-        est_x_src = X_grid(y_idx_src, x_idx_src);
-        est_y_src = Y_grid(y_idx_src, x_idx_src);
-        
-        all_est_positions(src, :) = [est_x_src, est_y_src];
+        est_x_src = all_est_positions(src, 1);
+        est_y_src = all_est_positions(src, 2);
         
         % Plot true source position
         plot(true_x, true_y, 'x', 'Color', source_colours(src, :), ...
