@@ -1,14 +1,14 @@
-clc; clear all; close all;
+clc; close all; %clear all;
 
 %Generate array output using 3D sound field model
 %For acoustic vector array of 1element each with four subcomponents
 
 %Written by L Marshall 27/11/2025
 
-
 %% DEFINE INPUT VARIABLES %%
+
 % Signal Parameters
-duration = 23; %Sample duration (s)
+duration = 30; %Sample duration (s)
 noise_level = 0.05; %Noise amplitude
 num_sources = 1; %Number of signal sources
 
@@ -19,11 +19,15 @@ source_positions = [
     %4, -2, 0.0; %Source 2
 ];
 
-% Source frequencies (Hz)
-source_frequencies = [
-    1500; %Source 1 freq
-    %2000 %Source 2 freq
-];
+% Source frequencies (Hz) - overridden in batch mode
+if ~exist('batch_test_freq', 'var')
+    source_frequencies = [
+        1500; %Source 1 freq
+        %2000 %Source 2 freq
+    ];
+else
+    source_frequencies = batch_test_freq;
+end
 
 % Source amplitudes 
 source_amplitudes = [
@@ -35,32 +39,48 @@ source_amplitudes = [
 c_o = 340; %Speed of sound (m/s)
 rho_o = 1.02; %Air Density at STP
 
-% Vector Sensor Array(s) Parameters;
+% Vector Sensor Array(s) Parameters
 N_a = 1; %Number of independent arrays
 N_v = 1; %No. of vector sensors
 d_y = 0.1; %Vector sensor y axis spacing (m)
-delta = 0.042; %MEMS colocation spacing (m)
+
+% Delta - overridden in batch mode
+if ~exist('batch_test_delta', 'var')
+    delta = 0.042; %MEMS colocation spacing (m)
+else
+    delta = batch_test_delta;
+end
 
 % Array centre geom 1
-% x_a1 = 2.0 + delta/2; % Geometric centre x-coordinate
 x_a1 = 0;
 z_a1 = 0; % Array centre z-coordinate
 y_a1 = 0;
-% y_a1 = -d_y/2 + delta/2; % Geometric centre y-coordinate
-A1_coord = [x_a1;y_a1;z_a1];
+A1_coord = [x_a1; y_a1; z_a1];
 
 % Array centre geom 2
-lambda = c_o/source_frequencies(1,:);
+lambda = c_o / source_frequencies(1, :);
 a_spacing = sqrt(((5*lambda)^2)/2); %x and y spacing for 5*lambda distance
-x_a2 = x_a1-a_spacing; % Geometric centre x-coordinate
+x_a2 = x_a1 - a_spacing; % Geometric centre x-coordinate
 z_a2 = 0; % Array centre z-coordinate
-y_a2 = y_a1-a_spacing; % Geometric centre y-coordinate
-A2_coord = [x_a2;y_a2;z_a2];
+y_a2 = y_a1 - a_spacing; % Geometric centre y-coordinate
+A2_coord = [x_a2; y_a2; z_a2];
 
 % Sampling Conditions
 d_t = 0.0001; %Time step (s)
-csv_filename = 'generatedsignal_avs.csv';
 
+% CSV filename - overridden in batch mode
+if ~exist('batch_csv_name', 'var')
+    csv_filename = 'generatedsignal_avs.csv';
+else
+    csv_filename = batch_csv_name;
+end
+
+%% CHECK FOR BATCH MODE - SUPPRESS FIGURES %%
+
+if exist('batch_test_freq', 'var')
+    % Suppress figures in batch mode
+    set(0, 'DefaultFigureVisible', 'off');
+end
 %% INITIALISE ARRARY GEOMETRY %%
 
 % Calculate number of microphones
@@ -297,6 +317,12 @@ ylim([min(all_y) - padding*max(y_range,0.5), max(all_y) + padding*max(y_range,0.
 
 axis equal;
 
+
+%% RESTORE FIGURE VISIBILITY %%
+
+if exist('batch_test_freq', 'var')
+    set(0, 'DefaultFigureVisible', 'on');
+end
 
 %% DISPLAY CONFIGURATION SUMMARY %%
 

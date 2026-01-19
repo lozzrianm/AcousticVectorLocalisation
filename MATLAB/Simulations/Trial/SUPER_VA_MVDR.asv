@@ -1264,7 +1264,7 @@ function [theta_deg, beam_pattern, fig_handle, beam_metrics, grating_detection] 
         for lobe_idx = 1:min(grating_detection.num_significant_lobes, 5)
             lobe_angle_rad = deg2rad(grating_detection.significant_lobe_angles(lobe_idx));
             lobe_level = grating_detection.significant_lobe_levels(lobe_idx);
-            polarplot(lobe_angle_rad, lobe_level, 'r.', 'MarkerSize', 12, ...
+            polarplot(lobe_angle_rad, lobe_level, 'r.', 'MarkerSize', 8, ...
                      'HandleVisibility', 'off');
         end
     end
@@ -1333,5 +1333,14 @@ function [theta_deg, beam_pattern, fig_handle, beam_metrics, grating_detection] 
             yn{grating_detection.grating_present + 1}, grating_detection.severity);
     
     fprintf('\n');
+end
+
+% Helper function for boolean to string
+function str = bool_to_str(val)
+    if val
+        str = 'YES';
+    else
+        str = 'No';
+    end
 end
 
