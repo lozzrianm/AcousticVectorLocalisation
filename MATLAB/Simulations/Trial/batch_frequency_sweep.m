@@ -5,7 +5,7 @@ clc; clear all; close all;
 
 %% BATCH TEST PARAMETERS %%
 
-batch_test_frequencies = linspace(600, 4600, 21);
+batch_test_frequencies = linspace(200, 5000, 25);
 batch_num_tests = length(batch_test_frequencies);
 delta_fixed = 0.04;
 c_0 = 340;

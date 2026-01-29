@@ -15,7 +15,7 @@ num_sources = 1; %Number of signal sources
 % More signal source parameters
 % Source positions [x, y, z] (m)
 source_positions = [
-    -1, 0, 0; %Source 1
+    -0.7071, 0.7071, 0; %Source 1
     %4, -2, 0.0; %Source 2
 ];
 
