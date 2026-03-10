@@ -1,0 +1,725 @@
+clc; clear all; close all;
+
+% L Marshall 15/09 
+% Single Source Localisation via a Linear Microphone Array
+
+% MVDR method of beamforming %
+% Using broadband analysis with spectrum blocks %
+% with eigenvalue decomposition, adaptive regularisation, and weighted MVDR
+
+%% DEFINE INPUT VARIABLES %%
+
+csv_filename = 'generatedsignal1.csv';
+
+% Array Parameters
+N_mics = 8; %number of receiving elements
+d_y = 0.02829; %sensor spacing (m)
+x_a = 0; %array centre x coordinate (m)
+z_a = 0; %array centre z coordinate (m)
+y_a = 0; %array centre y coordinate (m)
+
+% Physical Environment Parameters
+c_0 = 340; %speed of sound (m/s)
+
+% Sampling Characteristics
+freq_limit = 3000; %max freq for analysis (Hz)
+overlap = 0.5; %percentage overlap for sample window (%)
+loading = 1e-4; %set regularisation parameter (loading var in 2020 script)
+
+% % Grid Search Parameters
+% x_scan_points = 200;
+% y_scan_points = 200;
+% x_margin = 3; %(m)
+% y_margin = 2; %(m)
+
+% Grid Search Parameters
+grid_resolution = 0.015; %(m)
+% Margin around source
+%this set grid res is just here for consistency with sims for comparative
+%trials
+source_frequency = 1000;
+lambda = c_0/source_frequency;
+margin = max(1.5 * lambda, 0.5);
+max_extent = sqrt((A1_coord(1)-source_position(1,1))^2+(A1_coord(2)-source_positions(1,2))^2) + margin;
+
+% Calculate grid points for constant resolution
+x_margin = 2 * max_extent; %(m)
+y_margin = 2 * max_extent; %(m)
+
+x_scan_points = round(x_margin / grid_resolution) + 1; 
+y_scan_points = round(y_margin / grid_resolution) + 1;
+
+% Visualisation Parameters
+% Source position [x, y] (m) - for reference
+source_x = 1;
+source_y = 0.3;
+source_positions = [source_x,source_y,0];
+
+%% MICROPHONE CALIBRATION DATA PROCESSING %%
+
+% Calibration Parameters
+apply_calibration = false; %set to false to disable all corrections
+
+% Signal Conditioning Parameters
+apply_dc_removal = false; %remove DC offset from time-domain signals
+
+% Measured absolute sensitivities (mV/Pa)
+% Replace with your actual calibration data
+absolute_sensitivity_mVPa = [
+    94;  %mic 1
+    94;  %mic 2
+    94;  %mic 3
+    94;  %mic 4
+    % 50.7;  %mic 5
+    % 50.0;  %mic 6
+    % 48.7;  %mic 7
+    % 51.6;  %mic 8
+    % 49.5;  %mic 9
+    % 50.4;  %mic 10
+    % 50.1   %mic 11
+];
+
+% Normalise to the mean and calc relative sensitivities
+mean_sensitivity = mean(absolute_sensitivity_mVPa);
+mic_sensitivity = absolute_sensitivity_mVPa / mean_sensitivity; %column vector (11x1)
+
+fprintf('<strong>Microphone Calibration Processing</strong>\n');
+fprintf('Mean absolute sensitivity: %.2f mV/Pa\n', mean_sensitivity);
+fprintf('\nConverting from Absolute to Relative Sensitivity:\n');
+for mic = 1:length(mic_sensitivity)
+    fprintf('  Mic %d: %.2f mV/Pa → %.4f (%.1f%% of mean)\n', ...
+        mic, absolute_sensitivity_mVPa(mic), mic_sensitivity(mic), ...
+        mic_sensitivity(mic) * 100);
+end
+
+% Phase offset corrections (radians)
+% (+) vals mean microphone signal is ahead (leading)
+% (-) vals mean microphone signal is behind (lagging)
+% IMPORTANT: Must be column vector to match mic_sensitivity dimensions
+phase_offset = [
+    0;      %mic 1
+    0;   %mic 2
+   0;   %mic 3
+    0;   %mic 4
+   % -0.04;   %mic 5
+   %  0.01;   %mic 6
+   %  0.03;   %mic 7
+   % -0.02;   %mic 8
+   %  0.04;   %mic 9
+   % -0.01;   %mic 10
+   %  0       %mic 11
+]; %column vector (11x1)
+
+fprintf('\nPhase offsets: %.4f to %.4f rad (%.2f to %.2f deg)\n', ...
+    min(phase_offset), max(phase_offset), ...
+    rad2deg(min(phase_offset)), rad2deg(max(phase_offset)));
+fprintf('Phase offset mean: %.4f rad (%.2f deg)\n\n', ...
+    mean(phase_offset), rad2deg(mean(phase_offset)));
+
+%% LOAD IN GENERATED SIGNAL FROM CSV %%
+
+fprintf('Loading signal data from: %s\n', csv_filename);
+
+if ~exist(csv_filename, 'file')
+    error('Signal file not found: %s\nRun signal generation first.', csv_filename);
+end
+
+data = readmatrix(csv_filename);
+time = data(:, 1); %time vector
+[numRows, numCols] = size(data);
+
+N = numRows; %number of samples
+Nr = (numCols - 1) / 2; %number of receiving elements 
+
+fprintf('Loaded %d samples from %d microphones\n', N, Nr);
+
+%% COMBINE SIGNAL COMPONENTS FOR PROCESSING %%
+
+% Preallocate transmitted signal array
+tx = zeros(N, Nr); 
+
+for mic = 1:Nr
+    % Monopole signals
+    monopole_col = mic + 1; %columns 2-12
+    % Sinusoidal signals
+    sinusoidal_col = mic + 1 + Nr; %columns 13-23
+
+    tx(:, mic) = data(:, monopole_col) + data(:, sinusoidal_col);
+end
+
+tx = tx.'; %transpose signals, rows = sensors, columns = time samples
+
+%% SIGNAL CONDITIONING %%
+
+if apply_dc_removal==true
+    fprintf('Removing DC offset from signals...\n');
+    tx = tx - mean(tx, 2); %subtract mean from each microphone signal
+end
+
+%% ARRAY GEOMETRY SET UP %%
+
+n = linspace(-(Nr - 1) / 2, (Nr - 1) / 2, Nr); %number of sensors
+mic_positions = [x_a * ones(1, Nr); d_y * n; zeros(1, Nr)]; %sensor positions
+ 
+%% CONVERT TO FREQ DOMAIN %%
+
+fprintf('Converting to frequency domain...\n');
+
+d_t = time(2) - time(1); %time step (s)
+F_s = 1 / d_t; %sampling frequency (Hz)
+f = F_s * (0:floor(N/2)) / N; %frequency vector
+
+% Limit frequency range
+idx_limit = f <= freq_limit;
+
+% Preallocate FFT matrix
+tx_freq = zeros(Nr, sum(idx_limit));
+
+% Plot frequency spectrum
+figure('Name', 'Frequency Domain');
+hold on;
+for sensor = 1:Nr
+    % FFT of each sensor signal
+    Y = fft(tx(sensor, :));
+    Y = Y(1:floor(N/2)+1); %keep positive freqs (complex)
+    
+    % Store only the useful freqs (<= freq_limit)
+    tx_freq(sensor, :) = Y(idx_limit);
+    
+    % Plot magnitude spectrum 
+    Y_mag = abs(Y) / N;
+    Y_mag(2:end-1) = 2 * Y_mag(2:end-1);
+    Y_dB = 20 * log10(Y_mag + eps);
+    plot(f, Y_dB, 'DisplayName', sprintf('Sensor %d', sensor));
+end
+hold off;
+xlabel('Frequency (Hz)', 'FontName', 'Times New Roman', 'FontSize', 14);
+ylabel('Amplitude (dB)', 'FontName', 'Times New Roman', 'FontSize', 14);
+xlim([0 freq_limit]);
+legend('show', 'Location', 'best');
+grid on;
+set(gca, 'FontName', 'Times New Roman', 'FontSize', 14);
+
+%% DEFINING THE GRID SEARCH AREA %%
+
+fprintf('Defining search area...\n');
+
+x_scan = linspace(x_a - x_margin, x_a + x_margin, x_scan_points); 
+y_scan = linspace(y_a - y_margin, y_a + y_margin, y_scan_points);
+z_scan = 0; %2D plane for now
+
+[X_grid, Y_grid] = meshgrid(x_scan, y_scan);
+Z_grid = zeros(size(X_grid));
+
+candidate_points = [X_grid(:), Y_grid(:), Z_grid(:)]; %Nr x 3 matrix
+
+% Grid resolution in x and y directions
+x_res = x_scan(2) - x_scan(1);
+y_res = y_scan(2) - y_scan(1);
+grid_res = mean([x_res, y_res]);
+
+fprintf('Search grid: %d x %d points, resolution: %.4f m\n', ...
+    length(x_scan), length(y_scan), grid_res);
+
+%% CREATING FREQ BINS FOR BROADBAND ANALYSIS %%
+
+fprintf('Creating frequency bins...\n');
+
+% Maximum bin width for req spatial resolution
+max_binwidth = 1 / (8 * d_y * (Nr - 1) / c_0); %(Hz)
+size_fft = floor(F_s / max_binwidth);
+
+% Frequency spacing
+delta_f = F_s / N; %frequency spacing per bin
+fft_vec = F_s * (0:(size_fft - 1)) / size_fft; %freq vector
+
+% Target frequencies
+target_freqs = 0:max_binwidth:freq_limit;
+
+% Map each target to nearest snapshot FFT bin
+bin_index = zeros(size(target_freqs));
+for k = 1:length(target_freqs)
+    [~, bin_index(k)] = min(abs(fft_vec - target_freqs(k)));
+end
+
+% Generate bin indices within accepted range
+bin_index = unique(bin_index); %remove duplicates
+bin_index = bin_index(bin_index <= size_fft);
+bin_freqs = fft_vec(bin_index); %actual bin freqs
+num_bins = length(bin_index); %no. bins
+
+fprintf('Using %d frequency bins (%.1f - %.1f Hz)\n', ...
+    num_bins, min(bin_freqs), max(bin_freqs));
+
+num_snaps = 4 * Nr; %no. snapshots
+
+% Calc no. samples accounting for overlap
+num_samps = (num_snaps + 1) * size_fft * overlap;
+
+% Taper window
+window = hanning(size_fft)';
+
+%% CREATE SNAPSHOTS AND MAKE CSM %%
+
+fprintf('Creating snapshots and cross-spectral matrix...\n');
+
+snapshots = make_snapshots(tx, size_fft, overlap, window);
+fprintf('  Created %d snapshots\n', size(snapshots, 3));
+
+% Apply calibration corrections if enabled
+if apply_calibration
+    fprintf('  Applying calibration corrections...\n');
+    snapshots = apply_calibration_correction(snapshots, mic_sensitivity, phase_offset);
+end
+
+% Max no. snapshots that signal fits
+maxnum_snap = size(snapshots, 3); 
+
+r = create_csm(snapshots, bin_index, Nr, num_bins, maxnum_snap);
+fprintf('  Created %dx%dx%d cross-spectral matrix\n', size(r));
+
+%% PERFORM BEAMFORMING %%
+
+fprintf('\n<strong>Running MVDR Beamforming...</strong>\n');
+fprintf('  Regularisation parameter: %.2e\n', loading);
+
+% Run MVDR beamforming
+response_db = mvdr_beamforming(r, mic_positions, candidate_points, bin_freqs, c_0, loading);
+
+% 1D scan along y-axis at x=0 (for verification)
+fprintf('\n1D Scan (x = 0):\n');
+plot_1dscan_mvdr(r, mic_positions, source_y, bin_freqs, c_0, loading);
+
+% 2D scan of full search area
+fprintf('\n2D Scan:\n');
+[est_x, est_y] = plot_2dscan_mvdr(r, mic_positions, candidate_points, bin_freqs, c_0, ...
+    y_scan, x_scan, source_x, source_y, X_grid, Y_grid, loading);
+
+%% PERFORMANCE METRICS %%
+
+fprintf('\n<strong>Performance Metrics:</strong>\n');
+
+est_pos = [est_x, est_y];
+true_pos = [source_x, source_y];
+errors = true_pos - est_pos;
+
+squared_dist = sum(errors.^2);
+MSE = squared_dist;
+MSE_percent = (MSE / (grid_res^2)) * 100;
+radial_error = sqrt(squared_dist);
+
+% Angular error
+y_sensor = 0; %array centre y coordinate
+true_angle = atan2(source_y - y_sensor, source_x - x_a);
+est_angle = atan2(est_y - y_sensor, est_x - x_a);
+angular_error_deg = rad2deg(abs(true_angle - est_angle));
+% Normalise to 180 deg
+if angular_error_deg > 180
+    angular_error_deg = mod(angular_error_deg + 180, 360) - 180;
+end
+
+fprintf('Estimated position: (%.3f, %.3f) m\n', est_x, est_y);
+fprintf('Position error: dx = %.3f m, dy = %.3f m\n', errors(1), errors(2));
+fprintf('Radial error: %.3f m\n', radial_error);
+fprintf('Mean Squared Error: %.4f m²\n', MSE);
+fprintf('MSE (normalised): %.2f%% of grid resolution\n', MSE_percent);
+fprintf('Angular Error: %.4f deg\n', angular_error_deg);
+
+%% BEAM PATTERN ANALYSIS %%
+fprintf('\n<strong>GENERATING BEAM PATTERNS</strong>\n');
+
+% Determine radius from source position
+array_centre_2d = [x_a; y_a];
+distances = sqrt(sum((source_positions(:,1:2) - array_centre_2d').^2, 2));
+radius = median(distances);
+fprintf('Using radius = %.3f m (median source distance)\n', radius);
+
+% Compute near-field beam pattern
+[theta_deg, beam_pattern, fig_handle] = beam_pattern_ula(...
+    r, mic_positions, array_centre_2d, source_positions(:,1:2), ...
+    bin_freqs, c_0, loading, radius, 'Array Beam Pattern (MVDR)');
+
+%% FUNCTION DEFINITION %%
+
+% FUNCTION: MAKE SNAPSHOTS OF GENERATED SIGNAL
+% Make time domain snapshots of input signal
+function snapshots = make_snapshots(tx, size_fft, overlap, window)
+    % No. sample to move per snapshot
+    step = round(overlap * size_fft);
+    
+    % No. of full snapshots that fit in signal with given step size
+    num_snap = floor((size(tx, 2) - size_fft) / step) + 1; %no. snapshots 
+    % Start indices for each snapshot
+    start_idx = 1 + (0:(num_snap - 1)) * step;
+    
+    % Create index matrix (size_fft x num_snap)
+    idx_matrix = start_idx + (0:size_fft - 1)'; %each column = indices for a snapshot
+    
+    % Extract snapshots (force reshape into 3D)
+    snapshots = tx(:, idx_matrix);  
+    snapshots = reshape(snapshots, size(tx, 1), size_fft, num_snap);
+    
+    % Apply window along snapshots dimension
+    snapshots = snapshots .* reshape(window, [1, size_fft, 1]);
+end
+
+
+% FUNCTION: APPLY CALIBRATION CORRECTIONS
+% Apply sensitivity and phase corrections in frequency domain
+function snapshots_corrected = apply_calibration_correction(snapshots, mic_sensitivity, phase_offset)  
+    N_mics = size(snapshots, 1);
+    size_fft = size(snapshots, 2);
+    num_snap = size(snapshots, 3);
+    
+    % FFT each snapshot to frequency domain
+    snapshots_freq = fft(snapshots, [], 2); %(N_mics x size_fft x num_snap)
+    
+    % Create correction factors for each microphone
+    % correction = (1/sensitivity) * exp(-i*phase_offset)
+    % The 1/sensitivity normalises amplitude
+    % The exp(-i*phase_offset) removes the phase error
+    correction_factors = (1 ./ mic_sensitivity) .* exp(-1i * phase_offset);
+
+    % Reshape for broadcasting across all frequency bins and snapshots
+    correction_factors = reshape(correction_factors, [N_mics, 1, 1]); 
+    
+    % Apply corrections: multiply each frequency bin by correction factor
+    snapshots_freq_corrected = snapshots_freq .* correction_factors; 
+    
+    % Inverse fast fourier transform
+    snapshots_corrected = ifft(snapshots_freq_corrected, [], 2);
+    
+    % Ensure real output
+    snapshots_corrected = real(snapshots_corrected);
+end
+
+
+% FUNCTION: FFT AND CREATE CROSS-SPECTRAL MATRIX
+% Convert each block to freq domain and create cross-spectral matrix
+function r = create_csm(snapshots, bin_index, Nr, num_bins, maxnum_snap)
+    % FFT along the time dimension for all snapshots
+    fx = fft(snapshots, [], 2); %(Nr x size_fft x num_snap)    
+    
+    % Keep only the frequencies of interest
+    fx = fx(:, bin_index, :); %(Nr x num_bins x num_snap)
+    
+    % Preallocate CSM
+    r = zeros(Nr, Nr, num_bins);
+    
+    % Vectorised additions to CSM per snapshot
+    for jf = 1:num_bins
+        % Extract matrix for this frequency bin
+        fx1 = squeeze(fx(:, jf, :)); %(Nr x num_snap)
+    
+        % Compute CSM: sum over snapshots of outer products
+        r(:, :, jf) = fx1 * fx1'; %(Nr x Nr)
+    end
+    
+    % Average CSM over snapshots of sampled signal
+    r = r / maxnum_snap;
+end
+
+
+% FUNCTION: MVDR BEAMFORMING
+function response_db = mvdr_beamforming(r, mic_positions, candidate_points, bin_freqs, c_0, loading)
+
+    num_points = size(candidate_points, 1); %no. points to search
+    num_bins = size(r, 3);
+    Nr = size(r, 1);
+
+    % Preallocate arrays
+    mvdr_responses = zeros(num_points, num_bins);
+    cbf_responses = zeros(num_points, num_bins);
+
+    for jf = 1:num_bins
+        k = 2 * pi * bin_freqs(jf) / c_0; %wave no. for this freq bin
+        rf = squeeze(r(:, :, jf)); %covariance matrix for this freq bin
+        
+        % Eigenvalue decomposition (improve stability)
+        [ur, er] = eig(rf);
+        erv = real(diag(er));
+        
+        % Safety check for negative eigenvalues 
+        erv = max(erv, 1e-12);
+        
+        for n = 1:num_points
+            l_pt = candidate_points(n, :).';
+            
+            % Calculate steering vector
+            r_lm = sqrt(sum((mic_positions - l_pt).^2, 1));
+            v1 = exp(-1i * k * r_lm).'; %steering vector 
+            
+            % Conventional DAS beamformer output 
+            cbf_out = real(v1' * rf * v1);
+            cbf_responses(n, jf) = cbf_out;
+            
+            % Adaptive regularisation based on CBF output
+            lambda = loading * cbf_out; %lambda = diagonal loading factor
+            if lambda == 0
+                lambda = loading; %default to fixed loading
+            end
+            
+            % Weighted MVDR using eigendecomposition
+            rxv = (ur * diag(1 ./ (erv + lambda)) * ur') * v1;
+            
+            % Normalise to get weight vector
+            denominator = v1' * rxv;
+            if abs(denominator) < 1e-12
+                mvdr_responses(n, jf) = 0;
+            else
+                vmvdr = rxv / denominator; %MVDR weight vector
+                
+                % Calc weighted output power
+                mvdr_responses(n, jf) = abs(vmvdr' * rf * vmvdr);
+            end
+        end
+    end
+
+    % Broadband response by summing across frequencies
+    responses_sum = sum(mvdr_responses, 2);
+
+    % Convert to dB and normalise
+    response_db = 10 * log10(responses_sum + eps);
+    response_db = response_db - max(response_db);
+end
+
+
+% FUNCTION: 2D SCAN PLOTTING
+function [est_x, est_y] = plot_2dscan_mvdr(r, mic_positions, candidate_points, ...
+    bin_freqs, c_0, y_scan, x_scan, source_x, source_y, X_grid, Y_grid, loading)
+    
+    % Run MVDR beamforming
+    response_db = mvdr_beamforming(r, mic_positions, candidate_points, bin_freqs, c_0, loading);
+
+    % Reshape responses to a grid for plotting
+    grid_response = reshape(response_db, length(y_scan), length(x_scan));
+
+    % Plot spatial response map
+    figure('Name', '2D MVDR Beamforming');
+    imagesc(x_scan, y_scan, grid_response);
+    axis xy;
+    xlabel('X (m)', 'FontName', 'Times New Roman', 'FontSize', 14);
+    ylabel('Y (m)', 'FontName', 'Times New Roman', 'FontSize', 14);
+    colorbar;
+    colormap('jet');
+    hold on;
+
+    % Find estimated source coordinates
+    [max_val, max_idx] = max(grid_response(:));
+    [y_idx, x_idx] = ind2sub(size(grid_response), max_idx);
+    est_x = X_grid(y_idx, x_idx);
+    est_y = Y_grid(y_idx, x_idx);
+
+    fprintf('  Max response: %.2f dB at (%.3f, %.3f) m\n', max_val, est_x, est_y);
+
+    % Plot true source (red x) and estimated source (blue x)
+    plot(source_x, source_y, 'rx', 'MarkerSize', 12, 'LineWidth', 2, ...
+        'DisplayName', 'True Source');
+    plot(est_x, est_y, 'bx', 'MarkerSize', 12, 'LineWidth', 2, ...
+        'DisplayName', 'Estimated Source');
+    legend('Location', 'northeast');
+    set(gca, 'FontName', 'Times New Roman', 'FontSize', 14);
+end
+
+% FUNCTION: 1D SCAN PLOTTING
+function plot_1dscan_mvdr(r, mic_positions, source_y, bin_freqs, c_0, loading)
+    
+    % Scan along y-axis at fixed x and z
+    y_scan_line = linspace(source_y - 0.5, source_y + 0.5, 200);
+    x_fixed = -1; 
+    z_fixed = 0;
+
+    % Build candidate points
+    candidate_points_line = [x_fixed * ones(length(y_scan_line), 1), ...
+        y_scan_line(:), z_fixed * ones(length(y_scan_line), 1)];
+
+    % Run MVDR beamforming along the line
+    response_line = mvdr_beamforming(r, mic_positions, candidate_points_line, bin_freqs, c_0, loading);
+
+    % Find maximum response
+    [max_response, max_idx] = max(response_line);
+    y_est = y_scan_line(max_idx);
+
+    fprintf('  Max response: %.2f dB at y = %.3f m\n', max_response, y_est);
+    
+    % Plot the line response
+    figure('Name', '1D MVDR Scan');
+    plot(y_scan_line, response_line, 'LineWidth', 2);
+    xlabel('y position (m)', 'FontName', 'Times New Roman', 'FontSize', 14);
+    ylabel('Beamformer Response (dB)', 'FontName', 'Times New Roman', 'FontSize', 14);
+    grid on;
+    hold on;
+
+    % Plot true source and estimated source
+    plot(source_y, max(response_line), 'kx', 'MarkerSize', 10, 'LineWidth', 1.5); 
+    xline(source_y, 'r--', 'LineWidth', 1.5, 'DisplayName', 'True Source');
+    legend('Beamformer Response', 'True Source');
+    set(gca, 'FontName', 'Times New Roman', 'FontSize', 14);
+end
+
+
+% FUNCTION: COMPUTE NEAR-FIELD BEAM PATTERN FOR ULA MVDR
+% Compute proper beam pattern by evaluating MVDR response at each angle
+function [theta_deg, beam_pattern, fig_handle] = beam_pattern_ula(...
+    r, mic_positions, array_centre, source_positions, bin_freqs, c_0, ...
+    loading, radius, plot_title)
+    
+    fprintf('\n<strong>Computing Near-Field Beam Pattern (ULA MVDR):</strong>\n');
+    fprintf('  Range: %.3f m\n', radius);
+    fprintf('  Array centre: (%.3f, %.3f) m\n', array_centre);
+    
+    % Define angular resolution (1 degree)
+    num_angles = 360;
+    theta_deg = linspace(0, 360, num_angles + 1);
+    theta_deg = theta_deg(1:end-1); % Remove duplicate at 360°
+    theta_rad = deg2rad(theta_deg);
+    
+    % Get array dimensions
+    Nr = size(r, 1);
+    num_bins = size(r, 3);
+    
+    % Initialise beam pattern storage
+    mvdr_responses = zeros(num_angles, num_bins);
+    
+    % Compute MVDR response for each angle and frequency
+    for jf = 1:num_bins
+        k = 2 * pi * bin_freqs(jf) / c_0; % Wave number
+        rf = squeeze(r(:, :, jf)); % Covariance matrix for this frequency bin
+        
+        % Eigenvalue decomposition for stability
+        [ur, er] = eig(rf);
+        erv = real(diag(er));
+        erv = max(erv, 1e-12); % Safety check for negative eigenvalues
+        
+        % For each angular direction
+        for angle_idx = 1:num_angles
+            % Calculate source position at this angle and range
+            % 0° is along +Y axis (North), increases clockwise
+            x_pos = array_centre(1) + radius * sin(theta_rad(angle_idx));
+            y_pos = array_centre(2) + radius * cos(theta_rad(angle_idx));
+            source_pos = [x_pos; y_pos; 0];
+            
+            % Calculate steering vector for this direction
+            r_lm = sqrt(sum((mic_positions - source_pos).^2, 1));
+            v1 = exp(-1i * k * r_lm).'; % Steering vector
+            
+            % Conventional beamformer output (for adaptive regularisation)
+            cbf_out = real(v1' * rf * v1);
+            
+            % Adaptive regularisation based on CBF output
+            % (matching your mvdr_beamforming implementation)
+            lambda = loading * cbf_out;
+            if lambda == 0
+                lambda = loading; % Default to fixed loading
+            end
+            
+            % Weighted MVDR using eigendecomposition
+            rxv = (ur * diag(1 ./ (erv + lambda)) * ur') * v1;
+            denominator = v1' * rxv;
+            
+            if abs(denominator) > 1e-12
+                vmvdr = rxv / denominator;
+                % Use same formulation as your mvdr_beamforming function
+                mvdr_responses(angle_idx, jf) = abs(vmvdr' * rf * vmvdr);
+            else
+                mvdr_responses(angle_idx, jf) = 0;
+            end
+        end
+        
+        if mod(jf, 10) == 0 || jf == num_bins
+            fprintf('  Processed %d/%d frequency bins\r', jf, num_bins);
+        end
+    end
+    fprintf('\n');
+    
+    % Sum across frequencies for broadband response
+    beam_pattern_linear = sum(mvdr_responses, 2);
+    
+    % Convert to dB and normalise
+    beam_pattern = 10*log10(beam_pattern_linear + eps);
+    beam_pattern = beam_pattern - max(beam_pattern);
+    
+    % Create polar plot
+    fig_handle = figure('Name', plot_title, 'Position', [100, 100, 700, 700]);
+    
+    polarplot(theta_rad, beam_pattern, 'b-', 'LineWidth', 2);
+    ax = gca;
+    ax.ThetaDir = 'clockwise';
+    ax.ThetaZeroLocation = 'top'; % 0° is North (+Y direction)
+    rlim([min(beam_pattern), 0]);
+    
+    % Add radial grid labels
+    rticks_vals = linspace(min(beam_pattern), 0, 5);
+    rticks(rticks_vals);
+    rticklabels(arrayfun(@(x) sprintf('%.1f dB', x), rticks_vals, 'UniformOutput', false));
+    
+    % Add source positions if provided
+    if ~isempty(source_positions)
+        hold on;
+        for src = 1:size(source_positions, 1)
+            % Calculate angle to source from array centre
+            source_vec = source_positions(src, :)' - array_centre;
+            source_angle_rad = atan2(source_vec(1), source_vec(2));
+            
+            % Plot radial line to source direction
+            r_lim = rlim;
+            polarplot([source_angle_rad, source_angle_rad], r_lim, '--r', 'LineWidth', 2, ...
+                'DisplayName', sprintf('Source %d', src));
+        end
+        legend('Location', 'northoutside', 'Orientation', 'horizontal');
+        hold off;
+    end
+    
+    % Set title and formatting
+    title(sprintf('%s (r = %.3f m)', plot_title, radius), ...
+        'FontName', 'Times New Roman', 'FontSize', 16, 'FontWeight', 'bold');
+    ax.FontName = 'Times New Roman';
+    ax.FontSize = 12;
+    
+    % Display beam pattern statistics
+    fprintf('\n<strong>Beam Pattern Statistics:</strong>\n');
+    [~, peak_idx] = max(beam_pattern);
+    fprintf('  Peak response: 0.00 dB at %.1f degrees\n', theta_deg(peak_idx));
+    
+    % Calculate -3 dB beamwidth
+    threshold_3db = max(beam_pattern) - 3;
+    above_threshold = beam_pattern >= threshold_3db;
+    
+    % Find contiguous regions above threshold
+    above_threshold = above_threshold(:);
+    diff_threshold = diff([0; above_threshold; 0]);
+    starts = find(diff_threshold == 1);
+    ends = find(diff_threshold == -1) - 1;
+    
+    if ~isempty(starts)
+        fprintf('  -3 dB Beamwidth(s):\n');
+        for i = 1:length(starts)
+            if ends(i) >= starts(i)
+                beamwidth = theta_deg(ends(i)) - theta_deg(starts(i));
+                if beamwidth < 0
+                    beamwidth = beamwidth + 360;
+                end
+                fprintf('    Region %d: %.1f degrees (%.1f° to %.1f°)\n', ...
+                    i, beamwidth, theta_deg(starts(i)), theta_deg(ends(i)));
+            end
+        end
+    end
+    
+    % Calculate sidelobe level
+    main_lobe_mask = beam_pattern >= threshold_3db;
+    main_lobe_mask = main_lobe_mask(:);
+    if any(~main_lobe_mask)
+        beam_pattern_col = beam_pattern(:);
+        sidelobe_level = max(beam_pattern_col(~main_lobe_mask));
+        fprintf('  Maximum sidelobe level: %.2f dB\n', sidelobe_level);
+    end
+    
+    % Calculate directivity index
+    beam_linear = 10.^(beam_pattern(:)/10);
+    theta_rad_col = theta_rad(:);
+    integral_val = trapz(theta_rad_col, beam_linear);
+    DI = 10*log10(2*pi / integral_val);
+    fprintf('  Directivity Index: %.2f dB\n', DI);
+    
+    fprintf('\n');
+end

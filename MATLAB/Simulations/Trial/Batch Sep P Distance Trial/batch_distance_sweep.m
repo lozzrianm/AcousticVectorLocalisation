@@ -12,8 +12,8 @@ lambda = c_0 / test_frequency;
 
 % Distance range in wavelengths
 min_wavelengths = 0.5;
-max_wavelengths = 3;
-num_distance_steps = 6;
+max_wavelengths = 2;
+num_distance_steps = 7;
 
 batch_test_distances_lambda = linspace(min_wavelengths, max_wavelengths, num_distance_steps);
 batch_test_distances = batch_test_distances_lambda * lambda;
@@ -27,7 +27,7 @@ grid_resolution = 0.015; % m per grid point
 
 % Processing method selection
 % Set to 'standard' for 3-element [p, vx, vy] or '6element' for [p0, p1, p2, p3, vx, vy]
-processing_method = 'standard'; % Options: 'standard', '6element'
+processing_method = '6element'; % Options: 'standard', '6element'
 
 % Create results folder
 timestamp = datestr(now, 'yyyy-mm-dd_HH-MM-SS');
