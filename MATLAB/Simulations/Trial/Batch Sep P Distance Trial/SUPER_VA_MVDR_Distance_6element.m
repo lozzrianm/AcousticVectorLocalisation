@@ -656,6 +656,10 @@ function [response_db, mean_condition_number] = mvdr_vs_beamforming_6element(r_v
     end
     
     responses_sum = sum(mvdr_responses, 2);
+    peak_response = max(responses_sum);
+    if peak_response > 0
+        responses_sum = max(responses_sum, peak_response * 1e-10);
+    end
     response_db = 10*log10(responses_sum + eps);
     response_db = response_db - max(response_db);
 
@@ -713,7 +717,7 @@ function [all_est_positions, scan_2d_max_db] = plot_2dscan_mvdr_6element(...
     grid_response = reshape(response_db, length(y_scan), length(x_scan));
     
     figure('Name', sprintf('Array %d: 2D MVDR Beamforming (6-element)', array_num));
-    imagesc(x_scan, y_scan, grid_response, [-75 0]);
+    imagesc(x_scan, y_scan, grid_response);
     axis xy;
     xlabel('X (m)', 'FontName', 'Times New Roman', 'FontSize', 14);
     ylabel('Y (m)', 'FontName', 'Times New Roman', 'FontSize', 14);
@@ -791,7 +795,7 @@ function [all_est_positions, max_db] = ...
     end
     
     figure('Name', sprintf('Superimposed MVDR (6-elem, %d Arrays)', N_a));
-    imagesc(x_scan, y_scan, grid_response, [-75 0]);
+    imagesc(x_scan, y_scan, grid_response);
     axis xy;
     xlabel('X (m)', 'FontName', 'Times New Roman', 'FontSize', 14);
     ylabel('Y (m)', 'FontName', 'Times New Roman', 'FontSize', 14);
@@ -872,6 +876,10 @@ function [theta_deg, beam_pattern, fig_handle, beam_metrics] = compute_nearfield
     fprintf('\n');
     
     beam_pattern_linear = sum(mvdr_responses, 2);
+    peak_linear = max(beam_pattern_linear);
+    if peak_linear > 0
+        beam_pattern_linear = max(beam_pattern_linear, peak_linear * 1e-10);
+    end
     beam_pattern = 10*log10(beam_pattern_linear + eps);
     beam_pattern = beam_pattern - max(beam_pattern);
     
