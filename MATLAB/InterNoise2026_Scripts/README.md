@@ -37,7 +37,7 @@ recordings on a 6-channel data logger.
 
 These scripts synthesise microphone array signals from a 3D monopole sound field
 model and save the output to CSV for downstream processing. They are not run
-directly — they are called by the batch scripts via `run()`.
+directly, but are instead called by the batch scripts via `run()`.
 
 | Script | Purpose |
 |---|---|
@@ -47,8 +47,6 @@ directly — they are called by the batch scripts via `run()`.
 Both scripts support a **batch mode**, triggered automatically when the calling
 script sets workspace variables (`batch_csv_name`, `batch_test_freq`, etc.) before
 calling `run()`. In batch mode, figures and summary output are suppressed.
-
----
 
 ### Batch Processing
 
@@ -66,8 +64,6 @@ results to CSV and `.mat`.
 Each batch run creates a timestamped results folder containing per-frequency
 scan images, beam pattern figures, a summary CSV, and a `.mat` file.
 
----
-
 ### Experimental Processing
 
 These scripts process real recordings from a 6-channel data logger. Each array
@@ -84,8 +80,6 @@ Both scripts support optional **gain and phase calibration corrections** applied
 per frequency bin before CSM accumulation. Toggle flags and correction parameters
 are defined in the calibration section at the top of each script.
 
----
-
 ## Array Geometry
 
 | Parameter | ULA | AVA |
@@ -96,18 +90,14 @@ are defined in the calibration section at the top of each script.
 | Sub-array 2 centre | y = −262.9 mm | y = −320 mm |
 | Combined aperture | 360 mm | 360 mm |
 
----
-
 ## Dependencies
 
-All scripts are self-contained — helper functions are defined at the bottom of
+All scripts are self-contained; helper functions are defined at the bottom of
 each file. No external toolboxes are required beyond standard MATLAB.
 
 The experimental scripts require:
 - WAV recordings in the working directory (filenames defined at the top of each script)
 - `mic_gain_correction.mat` if gain correction is enabled
-
----
 
 ## Usage
 
@@ -135,17 +125,16 @@ ULA_OUTPUT_BATCH
 SUPER_VA_OUTPUT_BATCH
 ```
 
----
 
 ## Notes
 
-- The ULA CSM is **block-diagonal by construction** — off-diagonal blocks between
+- The ULA CSM is **block-diagonal by construction**: off-diagonal blocks between
   the two sequential recordings are zero, as there is no coherent cross-correlation
   to estimate between temporally independent recordings.
 - The AVA superimposed localisation uses a **ray intersection method**: the peak
   bearing from each array's independent MVDR scan is used to construct a ray, and
   the estimated source position is their geometric intersection.
-- The superimposed beam pattern computation is **simulation-only** — it requires
+- The superimposed beam pattern computation is **simulation-only**: it requires
   both arrays to observe the same stationary field simultaneously, which is not
   the case for sequentially recorded experimental data.
 - Grid resolution scales with wavelength (`grid_pts_per_lambda = 20`) but the
@@ -153,4 +142,4 @@ SUPER_VA_OUTPUT_BATCH
   variation from skewing cross-frequency comparisons.
 - Sub-pixel peak localisation uses **2D parabolic interpolation** (`refine_peak_2d`)
   to reduce grid quantisation error below one grid cell.
-```
+  
