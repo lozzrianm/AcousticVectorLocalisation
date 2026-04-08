@@ -142,4 +142,9 @@ SUPER_VA_OUTPUT_BATCH
   variation from skewing cross-frequency comparisons.
 - Sub-pixel peak localisation uses **2D parabolic interpolation** (`refine_peak_2d`)
   to reduce grid quantisation error below one grid cell.
+
+  ## Control Block Diagram of AVS Processing Script
+  The pipeline implements near-field acoustic source localisation using finite-difference acoustic vector sensors (AVS), covering signal conditioning, frequency-domain calibration, least-squares pressure gradient             estimation, and broadband MVDR beamforming across two independent arrays, with final source position resolved by power-domain product fusion and bearing-ray triangulation.
+
+ ![AVS Pipeline](pipeline.svg) 
   
