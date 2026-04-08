@@ -1,4 +1,3 @@
-```markdown
 # InterNoise 2026 — Acoustic Source Localisation Scripts
 
 MATLAB scripts supporting the paper:
@@ -6,7 +5,6 @@ MATLAB scripts supporting the paper:
 > **Hear, There, or Everywhere: Compact Acoustic Vector Sensor Arrays for Near-Field Sound Source Localisation**
 > L. Marshall — InterNoise 2026
 
----
 
 ## Overview
 
@@ -16,26 +14,22 @@ Array (AVA)** using acoustic vector sensors (AVS) with superimposed MVDR localis
 Both approaches are validated in simulation and against experimental data from sequential
 recordings on a 6-channel data logger.
 
----
 
 ## Repository Structure
 
 ```
 .
-├── Signal Generation
+├── Simulated
 │   ├── ULA_OUTPUT_BATCH.m
+|   ├── BATCH_FREQ_SWEEP_ULA.m
+│   ├── BATCH_FREQ_SWEEP_AVA.m
 │   └── SUPER_VA_OUTPUT_BATCH.m
-│
-├── Batch Processing
-│   ├── BATCH_FREQ_SWEEP_ULA.m
-│   └── BATCH_FREQ_SWEEP_AVA.m
-│
+|
 └── Experimental Processing
     ├── ULA_EXPERIMENTAL.m
     └── AVA_EXPERIMENTAL.m
 ```
 
----
 
 ## Script Descriptions
 
