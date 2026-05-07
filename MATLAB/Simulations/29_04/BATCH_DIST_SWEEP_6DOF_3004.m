@@ -1,0 +1,1952 @@
+clc; clear all; close all;
+
+% Batch distance sweep — four AVB steering vector configurations
+% Single acoustic vector sensor MVDR beamforming
+%
+% Tests four steering vector formulations for source localisation:
+%
+%   Planar V_3 (Eq 5):   V(theta)   = [1, cos(theta), sin(theta)]^T
+%     — 3-component, range-independent; angle-only localisation
+%
+%   Spherical V_3 (Eq 15): V(r,theta) = [e^{-jkR}/R,
+%                                        rho_c * (1+jkR) * e^{-jkR}/(j*omega*rho_0*R^2) * cos(theta),
+%                                        rho_c * (1+jkR) * e^{-jkR}/(j*omega*rho_0*R^2) * sin(theta)]^T
+%     — 3-component, range-dependent via centre-of-array NF velocity reactance
+%     — Pressure: full Green's function at AVS centre
+%     — Velocity: Euler's-equation NF correction at AVS centre
+%
+%   Modified V_6 (Eq 11):  V_6(theta, r) = [e^{-jkR1}/R1, e^{-jkR2}/R2,
+%                       e^{-jkR3}/R3, e^{-jkR4}/R4, NF*cos(theta), NF*sin(theta)]^T
+%     — 6-component, range-dependent via per-microphone pressure phases
+%     — Velocity entries also NF-corrected
+%     — R_n = ||p_n - r_s|| is the distance from mic n to the candidate source
+%
+%   Pressure-only V_4:     V_4(r) = [e^{-jkR1}/R1, e^{-jkR2}/R2,
+%                       e^{-jkR3}/R3, e^{-jkR4}/R4]^T
+%     — 4-component, range-dependent, no particle velocity
+%     — Tests whether pressure-phase information alone is sufficient
+%
+% Fixed test frequency: 1 kHz
+% Distance sweep: configurable in units of lambda
+% Single AVS: 1 element (4 mics) centred at origin, delta = 0.04 m
+%
+% Diagonal loading: 1e-2 (relative to max eigenvalue)
+%   For a 6x6 CSM built from only 4 physical sensors, rank deficiency
+%   makes 1e-2 relative loading appropriate. Cox et al. (1987) and
+%   Carlson (1988) show that for small arrays with steering mismatch,
+%   loading should dominate the smallest eigenvalues. The commonly cited
+%   delta = 10*sigma^2 rule corresponds to O(1e-2) relative loading for
+%   low-SNR scenarios; 1e-4 causes ill-conditioned inversions.
+%
+% Written by L Marshall 12/04/2026
+% Pressure-only (4-DOF) configuration and 1D ray analysis added 13/04/2026
+% Corrected CSV reader and FFT bin selection by L Marshall 30/04/2026
+% Spherical V_3 (Eq 15 form) added by L Marshall 02/05/2026
+%
+% Changes (02/05/2026):
+%   - Added Spherical V_3 steering vector (Eq 15 form) using full Green's
+%     function pressure and Euler-equation near-field velocity at the AVS
+%     centre. Reuses the 3-DOF data CSM (r_vs_3dof) so the only difference
+%     between Planar and Spherical V_3 is the steering vector model itself
+%   - Renamed previous "Baseline" -> "Planar V_3" everywhere for clarity
+%   - All four configurations included in 2D scans, beam patterns,
+%     performance metrics, ray response, summary printfs, results table
+%     and publication figures
+
+
+%% BATCH TEST PARAMETERS %%
+
+% Fixed source parameters
+test_freq = 1000; %fixed test frequency (Hz)
+c_0 = 340; %speed of sound (m/s)
+rho_0 = 1.02; %air density at STP
+lambda = c_0 / test_freq; %wavelength (m)
+
+% Distance sweep in units of wavelength
+% Sweep spans extreme near field (0.1 lambda) through far field (2 lambda)
+% to characterise where V_6 / V_4 range information is recoverable. Adjust
+% to taste — denser near 0.5-1 lambda is most informative for the transition
+distance_lambdas = [0.05, 0.1, 0.15, 0.2, 0.25, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.1, 1.2, 1.3, 1.4, 1.5, 2, 2.5, 3, 4, 5];
+batch_num_tests = length(distance_lambdas);
+batch_test_distances = distance_lambdas * lambda; %physical distances (m)
+
+% Source angle — fixed at 180 deg from +X axis
+source_angle_deg = 135;
+
+% Array parameters — single AVS
+N_a = 1; %single array
+N_v = 1; %single vector sensor
+delta_fixed = 0.06; %MEMS colocation spacing (m)
+
+% Processing parameters
+overlap = 0.5; %window overlap fraction
+loading = 1e-2; %regularisation — see header comments
+analysis_halfwidth_hz = 10; %half-width of analysis band around f_test (Hz)
+target_binwidth_hz = 1; %target FFT bin spacing within analysis band (Hz)
+
+% Grid parameters
+grid_pts_per_lambda = 20; %grid points per wavelength
+margin_fixed = 1; %fixed physical search margin (m)
+
+% 1D ray analysis parameters
+ray_angle_deg = 135; %ray direction from origin (deg, 0 = +X axis)
+ray_num_points = 200; %number of radial sample points along ray
+ray_range_lambdas = [0.05, 4]; %radial extent of ray in units of lambda
+
+% Create results folder
+timestamp = datestr(now, 'yyyy-mm-dd_HH-MM-SS');
+results_folder = sprintf('dist_sweep_6DOF_%s', timestamp);
+mkdir(results_folder);
+
+fprintf('\n<strong>BATCH DISTANCE SWEEP — FOUR STEERING VECTOR CONFIGURATIONS</strong>\n');
+fprintf('Planar V_3, Spherical V_3 (Eq 15), Modified V_6 (Eq 11), Pressure-only V_4\n');
+fprintf('Fixed frequency: %.0f Hz | Lambda: %.4f m\n', test_freq, lambda);
+fprintf('Testing %d distances: ', batch_num_tests);
+fprintf('%.2f  ', distance_lambdas);
+fprintf('lambda\n');
+fprintf('Source angle: %.0f deg from +X axis\n', source_angle_deg);
+fprintf('Delta: %.4f m | Delta/lambda: %.4f\n', delta_fixed, delta_fixed / lambda);
+fprintf('Loading factor: %.1e (relative to max eigenvalue)\n', loading);
+fprintf('Analysis half-width: %.1f Hz (centred on f_test)\n', analysis_halfwidth_hz);
+fprintf('1D ray angle: %.0f deg | Range: [%.2f, %.2f] lambda\n', ...
+    ray_angle_deg, ray_range_lambdas(1), ray_range_lambdas(2));
+fprintf('Results folder: %s\n\n', results_folder);
+
+
+%% INITIALISE RESULTS STORAGE %%
+
+batch_res_distance_lambda = zeros(batch_num_tests, 1);
+batch_res_distance_m = zeros(batch_num_tests, 1);
+batch_res_source_x = zeros(batch_num_tests, 1);
+batch_res_source_y = zeros(batch_num_tests, 1);
+batch_res_grid_resolution = zeros(batch_num_tests, 1);
+
+% Planar V_3 metrics (Eq 5 — range-independent)
+batch_res_radial_error_3dof = zeros(batch_num_tests, 1);
+batch_res_angular_error_3dof = zeros(batch_num_tests, 1);
+batch_res_cond_num_3dof = zeros(batch_num_tests, 1);
+batch_res_cond_num_loaded_3dof = zeros(batch_num_tests, 1);
+
+% Spherical V_3 metrics (Eq 15 — range-dependent via centre-of-array NF reactance)
+batch_res_radial_error_3dofS = zeros(batch_num_tests, 1);
+batch_res_angular_error_3dofS = zeros(batch_num_tests, 1);
+batch_res_cond_num_3dofS = zeros(batch_num_tests, 1);
+batch_res_cond_num_loaded_3dofS = zeros(batch_num_tests, 1);
+
+% Modified V_6 metrics (Eq 11 — range-dependent)
+batch_res_radial_error_6dof = zeros(batch_num_tests, 1);
+batch_res_angular_error_6dof = zeros(batch_num_tests, 1);
+batch_res_cond_num_6dof = zeros(batch_num_tests, 1);
+batch_res_cond_num_loaded_6dof = zeros(batch_num_tests, 1);
+
+% Pressure-only V_4 metrics (4-DOF — no velocity)
+batch_res_radial_error_4dof = zeros(batch_num_tests, 1);
+batch_res_angular_error_4dof = zeros(batch_num_tests, 1);
+batch_res_cond_num_4dof = zeros(batch_num_tests, 1);
+batch_res_cond_num_loaded_4dof = zeros(batch_num_tests, 1);
+
+% Beam pattern metrics
+batch_res_beamwidth_3dof = zeros(batch_num_tests, 1);
+batch_res_beamwidth_3dofS = zeros(batch_num_tests, 1);
+batch_res_beamwidth_6dof = zeros(batch_num_tests, 1);
+batch_res_beamwidth_4dof = zeros(batch_num_tests, 1);
+batch_res_DI_3dof = zeros(batch_num_tests, 1);
+batch_res_DI_3dofS = zeros(batch_num_tests, 1);
+batch_res_DI_6dof = zeros(batch_num_tests, 1);
+batch_res_DI_4dof = zeros(batch_num_tests, 1);
+batch_res_sidelobe_3dof = zeros(batch_num_tests, 1);
+batch_res_sidelobe_3dofS = zeros(batch_num_tests, 1);
+batch_res_sidelobe_6dof = zeros(batch_num_tests, 1);
+batch_res_sidelobe_4dof = zeros(batch_num_tests, 1);
+
+% 1D ray peak distance metrics
+batch_res_ray_peak_3dof = zeros(batch_num_tests, 1);
+batch_res_ray_peak_3dofS = zeros(batch_num_tests, 1);
+batch_res_ray_peak_6dof = zeros(batch_num_tests, 1);
+batch_res_ray_peak_4dof = zeros(batch_num_tests, 1);
+
+% -3 dB range bracket metrics (peak sharpness)
+batch_res_range_3dB_3dof = zeros(batch_num_tests, 1);
+batch_res_range_3dB_3dofS = zeros(batch_num_tests, 1);
+batch_res_range_3dB_6dof = zeros(batch_num_tests, 1);
+batch_res_range_3dB_4dof = zeros(batch_num_tests, 1);
+batch_res_saturated_3dof = false(batch_num_tests, 1);
+batch_res_saturated_3dofS = false(batch_num_tests, 1);
+batch_res_saturated_6dof = false(batch_num_tests, 1);
+batch_res_saturated_4dof = false(batch_num_tests, 1);
+
+
+%% RUN BATCH TESTS %%
+
+for batch_test_idx = 1:batch_num_tests
+
+    fprintf('\n========================================\n');
+    fprintf('<strong>TEST %d/%d: r = %.2f lambda (%.4f m)</strong>\n', ...
+        batch_test_idx, batch_num_tests, distance_lambdas(batch_test_idx), ...
+        batch_test_distances(batch_test_idx));
+    fprintf('========================================\n');
+
+    source_distance_m = batch_test_distances(batch_test_idx);
+    dist_lambda = distance_lambdas(batch_test_idx);
+
+    % Source position at fixed angle
+    source_x = source_distance_m * cosd(source_angle_deg);
+    source_y = source_distance_m * sind(source_angle_deg);
+
+    % Grid resolution
+    grid_resolution = lambda / grid_pts_per_lambda;
+
+    % Store test parameters
+    batch_res_distance_lambda(batch_test_idx) = dist_lambda;
+    batch_res_distance_m(batch_test_idx) = source_distance_m;
+    batch_res_source_x(batch_test_idx) = source_x;
+    batch_res_source_y(batch_test_idx) = source_y;
+    batch_res_grid_resolution(batch_test_idx) = grid_resolution;
+
+    fprintf('Source position: (%.4f, %.4f) m\n', source_x, source_y);
+    fprintf('Lambda: %.4f m | Grid resolution: %.4f m\n', lambda, grid_resolution);
+
+
+    % STEP 1: CLEAR PREVIOUS RUN VARIABLES %
+
+    vars_to_clear = {'source_positions', 'source_frequencies', 'source_amplitudes', ...
+        'r_vs_3dof', 'r_vs_6dof', 'r_vs_4dof', ...
+        'response_db_3dof', 'response_db_3dofS', 'response_db_6dof', 'response_db_4dof'};
+    for v = 1:length(vars_to_clear)
+        if exist(vars_to_clear{v}, 'var')
+            clear(vars_to_clear{v});
+        end
+    end
+
+
+    % STEP 2: RUN SIGNAL GENERATION SCRIPT %
+
+    fprintf('\nGenerating signal at r=%.4f m (%.2f lambda)...\n', ...
+        source_distance_m, dist_lambda);
+
+    batch_test_freq = test_freq;
+    batch_test_delta = delta_fixed;
+    batch_test_source_x = source_x;
+    batch_test_source_y = source_y;
+    batch_test_distance = source_distance_m;
+    batch_test_distance_lambda = dist_lambda;
+    batch_csv_name = fullfile(results_folder, ...
+        sprintf('signal_%02d_%.2flambda.csv', batch_test_idx, dist_lambda));
+
+    run('sig_gen_6comp_dist_3004.m');
+    fprintf('  Signal generation complete\n');
+
+
+    % STEP 3: LOAD SIGNAL FROM CSV %
+    % CSV format: [time, mic_1, mic_2, ..., mic_N_m] — single signal per
+    % channel (no monopole/sinusoidal split)
+
+    fprintf('\nLoading signal from: %s\n', csv_filename);
+
+    data_table = readtable(csv_filename);
+    data = table2array(data_table);
+    time = data(:, 1);
+    N = size(data, 1);
+    N_ma = N_v * 4; %microphones per array
+    N_m = N_a * N_ma; %total microphones
+    N_m_csv = size(data, 2) - 1;
+
+    if N_m_csv ~= N_m
+        warning('CSV holds %d mics; expected %d for N_a=%d, N_v=%d. Check sig_gen settings.', ...
+            N_m_csv, N_m, N_a, N_v);
+    end
+
+    fprintf('  Loaded %d samples | %d mics\n', N, N_m);
+
+
+    % STEP 4: ASSEMBLE SIGNAL MATRIX FOR PROCESSING %
+    % Rows = sensors, columns = time samples (MVDR convention)
+
+    tx_vs = data(:, 2:(N_m + 1)).';
+
+
+    % STEP 5: ARRAY GEOMETRY SETUP %
+
+    A1_coord = [0; 0; 0];
+
+    mic_offsets = delta_fixed / 2 * [-1, 1, 1, -1; -1, -1, 1, 1; 0, 0, 0, 0];
+
+    vs_centres = zeros(3, N_v);
+    mic_positions = zeros(3, N_m);
+    for vs = 1:N_v
+        vs_centres(:, vs) = A1_coord;
+        idx = (vs - 1) * 4 + (1:4);
+        mic_positions(:, idx) = vs_centres(:, vs) + mic_offsets;
+    end
+
+    fprintf('  Microphone positions (m):\n');
+    for m = 1:N_m
+        fprintf('    Mic %d: (%.4f, %.4f, %.4f)\n', m, mic_positions(:, m));
+    end
+
+
+    % STEP 6: CONVERT TO FREQUENCY DOMAIN %
+
+    fprintf('Converting to frequency domain...\n');
+
+    d_t = time(2) - time(1);
+    F_s = 1 / d_t;
+
+
+    % STEP 7: CHOOSE FFT LENGTH AND ANALYSIS BINS %
+    % Pick size_fft so that f_test lands exactly on a bin centre at the
+    % target bin spacing — keeps signal energy in a small number of
+    % adjacent bins rather than smearing it across the spectrum, and
+    % avoids integrating noise-only bins into the broadband MVDR sum.
+    % Critical for the V_6 vs V_3 comparison: noise-only bins dilute the
+    % range-dependent phase information that V_6 is meant to exploit.
+
+    fprintf('Selecting analysis bins...\n');
+
+    f_band_lo = test_freq - analysis_halfwidth_hz;
+    f_band_hi = test_freq + analysis_halfwidth_hz;
+
+    cycles_per_window = round(test_freq / target_binwidth_hz);
+    size_fft = round(cycles_per_window * F_s / test_freq);
+    actual_binwidth = F_s / size_fft;
+
+    % Cap at recording length for sufficient snapshot count
+    if size_fft > N / 4
+        size_fft = 2^floor(log2(N / 4));
+        actual_binwidth = F_s / size_fft;
+        fprintf('  Capped size_fft at %d (recording too short for target binwidth)\n', size_fft);
+    end
+
+    fft_vec = F_s * (0:(size_fft - 1)) / size_fft;
+
+    bin_mask = (fft_vec >= f_band_lo) & (fft_vec <= f_band_hi);
+    bin_index = find(bin_mask);
+    bin_freqs = fft_vec(bin_index);
+    num_bins = length(bin_index);
+
+    if num_bins == 0
+        % Fallback — analysis band narrower than one bin width
+        [~, nearest] = min(abs(fft_vec(1:floor(size_fft/2)) - test_freq));
+        bin_index = nearest;
+        bin_freqs = fft_vec(nearest);
+        num_bins = 1;
+        fprintf('  Analysis band narrower than bin width — using single nearest bin\n');
+    end
+
+    fprintf('  size_fft = %d | bin width = %.3f Hz | %d bins (%.1f-%.1f Hz)\n', ...
+        size_fft, actual_binwidth, num_bins, min(bin_freqs), max(bin_freqs));
+
+
+    % STEP 8: CREATE SNAPSHOTS %
+
+    fprintf('Creating snapshots...\n');
+
+    window = hanning(size_fft)';
+    snapshots = make_snapshots(tx_vs, size_fft, overlap, window);
+    fprintf('  Created %d snapshots\n', size(snapshots, 3));
+
+
+    % STEP 9: BUILD CROSS-SPECTRAL MATRICES — ALL METHODS %
+    % Note: Planar V_3 and Spherical V_3 share the same 3-DOF data CSM
+    % (r_vs_3dof). They differ only in the steering vector model applied
+    % during MVDR processing. This is the correct experimental control —
+    % the only thing varying between the two V_3 variants is the steering
+    % vector itself.
+
+    fprintf('Building cross-spectral matrices...\n');
+
+    % Planar / Spherical V_3: X = [P_avg, Vx, Vy]^T
+    r_vs_3dof = create_csm_baseline(snapshots, bin_index, ...
+        delta_fixed, bin_freqs, rho_0, N_v, num_bins, c_0);
+
+    % Modified V_6: X_6 = [P1, P2, P3, P4, Vx, Vy]^T — Eq 10
+    r_vs_6dof = create_csm_modified(snapshots, bin_index, ...
+        delta_fixed, bin_freqs, rho_0, N_v, num_bins, c_0);
+
+    % Pressure-only V_4: X_4 = [P1, P2, P3, P4]^T — no velocity
+    r_vs_4dof = create_csm_pressure_only(snapshots, bin_index, ...
+        delta_fixed, bin_freqs, rho_0, N_v, num_bins, c_0);
+
+    fprintf('  3-DOF CSM (3x3, shared by Planar/Spherical V_3): %dx%dx%d\n', size(r_vs_3dof));
+    fprintf('  Modified CSM (6x6): %dx%dx%d\n', size(r_vs_6dof));
+    fprintf('  Pressure-only CSM (4x4): %dx%dx%d\n', size(r_vs_4dof));
+
+
+    % STEP 10: CONDITION NUMBER ANALYSIS %
+
+    fprintf('\n<strong>CONDITION NUMBER ANALYSIS</strong>\n');
+
+    cond_3dof_raw = zeros(num_bins, 1);
+    cond_3dof_loaded = zeros(num_bins, 1);
+    cond_6dof_raw = zeros(num_bins, 1);
+    cond_6dof_loaded = zeros(num_bins, 1);
+    cond_4dof_raw = zeros(num_bins, 1);
+    cond_4dof_loaded = zeros(num_bins, 1);
+
+    for jf = 1:num_bins
+        % 3x3 (shared by Planar / Spherical V_3)
+        rf3 = squeeze(r_vs_3dof(:,:,jf));
+        cond_3dof_raw(jf) = cond(rf3);
+        erv3 = real(eig(rf3));
+        erv3 = max(erv3, 1e-12);
+        lambda_load3 = loading * max(erv3);
+        cond_3dof_loaded(jf) = cond(rf3 + lambda_load3 * eye(size(rf3)));
+
+        % Modified 6x6
+        rf6 = squeeze(r_vs_6dof(:,:,jf));
+        cond_6dof_raw(jf) = cond(rf6);
+        erv6 = real(eig(rf6));
+        erv6 = max(erv6, 1e-12);
+        lambda_load6 = loading * max(erv6);
+        cond_6dof_loaded(jf) = cond(rf6 + lambda_load6 * eye(size(rf6)));
+
+        % Pressure-only 4x4
+        rf4 = squeeze(r_vs_4dof(:,:,jf));
+        cond_4dof_raw(jf) = cond(rf4);
+        erv4 = real(eig(rf4));
+        erv4 = max(erv4, 1e-12);
+        lambda_load4 = loading * max(erv4);
+        cond_4dof_loaded(jf) = cond(rf4 + lambda_load4 * eye(size(rf4)));
+    end
+
+    med_cond_3dof_raw = median(cond_3dof_raw);
+    med_cond_3dof_loaded = median(cond_3dof_loaded);
+    med_cond_6dof_raw = median(cond_6dof_raw);
+    med_cond_6dof_loaded = median(cond_6dof_loaded);
+    med_cond_4dof_raw = median(cond_4dof_raw);
+    med_cond_4dof_loaded = median(cond_4dof_loaded);
+
+    batch_res_cond_num_3dof(batch_test_idx) = med_cond_3dof_raw;
+    batch_res_cond_num_loaded_3dof(batch_test_idx) = med_cond_3dof_loaded;
+    batch_res_cond_num_3dofS(batch_test_idx) = med_cond_3dof_raw;        %same CSM
+    batch_res_cond_num_loaded_3dofS(batch_test_idx) = med_cond_3dof_loaded;
+    batch_res_cond_num_6dof(batch_test_idx) = med_cond_6dof_raw;
+    batch_res_cond_num_loaded_6dof(batch_test_idx) = med_cond_6dof_loaded;
+    batch_res_cond_num_4dof(batch_test_idx) = med_cond_4dof_raw;
+    batch_res_cond_num_loaded_4dof(batch_test_idx) = med_cond_4dof_loaded;
+
+    fprintf('  3-DOF CSM (Planar/Spherical V_3): median cond = %.2e (raw) | %.2e (loaded)\n', ...
+        med_cond_3dof_raw, med_cond_3dof_loaded);
+    fprintf('  Modified CSM (6x6): median cond = %.2e (raw) | %.2e (loaded)\n', ...
+        med_cond_6dof_raw, med_cond_6dof_loaded);
+    fprintf('  Pressure-only CSM (4x4): median cond = %.2e (raw) | %.2e (loaded)\n', ...
+        med_cond_4dof_raw, med_cond_4dof_loaded);
+
+    if med_cond_6dof_raw > 1e10
+        fprintf('  WARNING: modified CSM poorly conditioned — loading essential\n');
+    end
+    if med_cond_4dof_raw > 1e10
+        fprintf('  WARNING: pressure-only CSM poorly conditioned — loading essential\n');
+    end
+
+
+    % STEP 11: DEFINE GRID SEARCH AREA %
+
+    fprintf('Defining search area...\n');
+
+    array_centre_y = 0;
+    [x_scan, y_scan, X_grid, Y_grid, candidate_points, grid_res] = ...
+        build_search_grid(test_freq, c_0, source_distance_m, ...
+        array_centre_y, grid_pts_per_lambda, margin_fixed);
+
+    fprintf('  Search grid: %d x %d points, resolution: %.4f m\n', ...
+        length(x_scan), length(y_scan), grid_res);
+
+
+    % STEP 12: PERFORM MVDR BEAMFORMING — ALL METHODS %
+
+    fprintf('\n<strong>Running MVDR Beamforming...</strong>\n');
+    fprintf('  Loading factor: %.1e\n', loading);
+
+    source_positions = [source_x, source_y, 0];
+    num_sources = 1;
+
+    % Planar V_3 — V(theta) = [1, cos(theta), sin(theta)]^T (Eq 5)
+    fprintf('  Processing Planar V_3 (Eq 5 — range-independent)...\n');
+    response_db_3dof = mvdr_baseline(r_vs_3dof, vs_centres, ...
+        candidate_points, bin_freqs, c_0, rho_0, loading, num_bins, N_v);
+
+    % Spherical V_3 — V(r,theta) with full Green's function and NF velocity (Eq 15)
+    fprintf('  Processing Spherical V_3 (Eq 15 — NF velocity reactance)...\n');
+    response_db_3dofS = mvdr_spherical(r_vs_3dof, vs_centres, ...
+        candidate_points, bin_freqs, c_0, rho_0, loading, num_bins, N_v);
+
+    % Modified V_6 — V_6(theta,r) with per-mic phases (Eq 11, NF-corrected)
+    fprintf('  Processing Modified V_6 (Eq 11 — range-dependent)...\n');
+    response_db_6dof = mvdr_modified(r_vs_6dof, vs_centres, mic_positions, ...
+        candidate_points, bin_freqs, c_0, rho_0, loading, num_bins, N_v);
+
+    % Pressure-only V_4 — V_4(r) with per-mic phases, no velocity
+    fprintf('  Processing Pressure-only V_4 (4-DOF — no velocity)...\n');
+    response_db_4dof = mvdr_pressure_only(r_vs_4dof, vs_centres, mic_positions, ...
+        candidate_points, bin_freqs, c_0, rho_0, loading, num_bins, N_v);
+
+    fprintf('  Planar V_3 response range:    [%.2f, %.2f] dB\n', ...
+        min(response_db_3dof), max(response_db_3dof));
+    fprintf('  Spherical V_3 response range: [%.2f, %.2f] dB\n', ...
+        min(response_db_3dofS), max(response_db_3dofS));
+    fprintf('  Modified V_6 response range:  [%.2f, %.2f] dB\n', ...
+        min(response_db_6dof), max(response_db_6dof));
+    fprintf('  Pressure-only V_4 response range: [%.2f, %.2f] dB\n', ...
+        min(response_db_4dof), max(response_db_4dof));
+
+
+    % STEP 13: 2D SCAN PLOTS %
+
+    fprintf('\nPlotting 2D scans...\n');
+
+    method_names  = {'baseline_planar', 'baseline_spherical', 'modified', 'pressure_only'};
+    method_labels = {'Planar V_3 (3-Comp)', 'Spherical V_3 (3-Comp)', ...
+                     'Modified V_6 (6-Comp)', 'Pressure-only V_4 (4-Comp)'};
+    responses     = {response_db_3dof, response_db_3dofS, response_db_6dof, response_db_4dof};
+
+    for method = 1:4
+        grid_response = reshape(responses{method}, length(y_scan), length(x_scan));
+        grid_response_norm = grid_response - max(grid_response(:));
+
+        figure('Color', 'w', 'Position', [100 100 520 440]);
+        imagesc(x_scan, y_scan, grid_response_norm);
+        display_range_dB = 60;
+        adaptive_floor = prctile(grid_response_norm(:), 0.5);
+        display_floor = max(-display_range_dB, adaptive_floor);
+        clim([display_floor, 0]);
+        axis xy; axis tight;
+        colormap(gca, 'jet');
+        cb = colorbar;
+        cb.Label.String = 'Normalised Response (dB)';
+        cb.Label.Interpreter = 'latex';
+        xlabel('$x$ (m)', 'Interpreter', 'latex', 'FontSize', 14);
+        ylabel('$y$ (m)', 'Interpreter', 'latex', 'FontSize', 14);
+        set(gca, 'FontName', 'Times New Roman', 'FontSize', 12, ...
+            'LineWidth', 1.0, 'Box', 'on', 'Layer', 'top');
+        grid off; hold on;
+        plot(source_x, source_y, 'kx', 'MarkerSize', 5, 'LineWidth', 1.5, ...
+            'DisplayName', 'True source');
+
+        [est_x, est_y, ~] = refine_peak_2d(grid_response_norm, x_scan, y_scan);
+        plot(est_x, est_y, 'ko', 'MarkerSize', 10, 'LineWidth', 1.5, ...
+            'MarkerFaceColor', 'none', 'DisplayName', 'Estimated source');
+
+        plot(0, 0, 'ks', 'MarkerSize', 9, 'LineWidth', 1, ...
+            'MarkerFaceColor', 'w', 'DisplayName', 'Array');
+
+        legend('Location', 'northeast', 'FontName', 'Times New Roman', ...
+            'FontSize', 10, 'Color', 'w', 'TextColor', 'k', 'Box', 'on');
+
+        base_name = sprintf('%02d_%.2flambda_%s_2dscan', batch_test_idx, dist_lambda, method_names{method});
+        save_figure(gcf, results_folder, base_name);
+    end
+
+
+    % STEP 14: PERFORMANCE METRICS %
+
+    fprintf('\n<strong>PERFORMANCE METRICS</strong>\n');
+
+    response_names = {'Planar V_3 (3-Comp)', 'Spherical V_3 (3-Comp)', ...
+                      'Modified V_6 (6-Comp)', 'Pressure-only V_4 (4-Comp)'};
+    responses_norm = {response_db_3dof  - max(response_db_3dof), ...
+                      response_db_3dofS - max(response_db_3dofS), ...
+                      response_db_6dof  - max(response_db_6dof), ...
+                      response_db_4dof  - max(response_db_4dof)};
+    ref_pos = [0; 0];
+
+    for case_idx = 1:4
+        fprintf('\n<strong>%s:</strong>\n', response_names{case_idx});
+
+        grid_response = reshape(responses_norm{case_idx}, length(y_scan), length(x_scan));
+        [est_x, est_y, ~] = refine_peak_2d(grid_response, x_scan, y_scan);
+        est_pos = [est_x, est_y];
+        true_pos = [source_x, source_y];
+
+        errors = true_pos - est_pos;
+        radial_error = norm(errors);
+        angular_error_deg = compute_angular_error(true_pos, est_pos, ref_pos');
+
+        fprintf('  Estimated position: (%.4f, %.4f) m\n', est_pos);
+        fprintf('  Position error: dx = %.4f m, dy = %.4f m\n', errors);
+        fprintf('  Radial error: %.4f m (%.4f lambda)\n', radial_error, radial_error / lambda);
+        fprintf('  Angular error: %.3f deg\n', angular_error_deg);
+
+        switch case_idx
+            case 1
+                batch_res_radial_error_3dof(batch_test_idx) = radial_error;
+                batch_res_angular_error_3dof(batch_test_idx) = angular_error_deg;
+            case 2
+                batch_res_radial_error_3dofS(batch_test_idx) = radial_error;
+                batch_res_angular_error_3dofS(batch_test_idx) = angular_error_deg;
+            case 3
+                batch_res_radial_error_6dof(batch_test_idx) = radial_error;
+                batch_res_angular_error_6dof(batch_test_idx) = angular_error_deg;
+            case 4
+                batch_res_radial_error_4dof(batch_test_idx) = radial_error;
+                batch_res_angular_error_4dof(batch_test_idx) = angular_error_deg;
+        end
+    end
+
+
+    % STEP 15: BEAM PATTERN ANALYSIS %
+
+    fprintf('\n<strong>GENERATING BEAM PATTERNS</strong>\n');
+
+    array_centre_2d = mean(vs_centres(1:2,:), 2);
+    radius = source_distance_m;
+
+    % Planar V_3 beam pattern
+    [~, ~, fig_3, bm_3] = beam_pattern_baseline(...
+        r_vs_3dof, vs_centres, array_centre_2d, source_positions(:,1:2), ...
+        bin_freqs, c_0, rho_0, loading, num_bins, N_v, radius, ...
+        sprintf('Planar V_3 (r = %.2f lambda)', dist_lambda));
+    save_figure(fig_3, results_folder, sprintf('%02d_%.2flambda_baseline_planar_beam', batch_test_idx, dist_lambda));
+    close(fig_3);
+
+    batch_res_beamwidth_3dof(batch_test_idx) = bm_3.beamwidth_3dB;
+    batch_res_DI_3dof(batch_test_idx) = bm_3.directivity_index;
+    batch_res_sidelobe_3dof(batch_test_idx) = bm_3.sidelobe_level;
+
+    % Spherical V_3 beam pattern (reuses 3-DOF CSM)
+    [~, ~, fig_3S, bm_3S] = beam_pattern_spherical(...
+        r_vs_3dof, vs_centres, array_centre_2d, source_positions(:,1:2), ...
+        bin_freqs, c_0, rho_0, loading, num_bins, N_v, radius, ...
+        sprintf('Spherical V_3 (r = %.2f lambda)', dist_lambda));
+    save_figure(fig_3S, results_folder, sprintf('%02d_%.2flambda_baseline_spherical_beam', batch_test_idx, dist_lambda));
+    close(fig_3S);
+
+    batch_res_beamwidth_3dofS(batch_test_idx) = bm_3S.beamwidth_3dB;
+    batch_res_DI_3dofS(batch_test_idx) = bm_3S.directivity_index;
+    batch_res_sidelobe_3dofS(batch_test_idx) = bm_3S.sidelobe_level;
+
+    % Modified V_6 beam pattern
+    [~, ~, fig_6, bm_6] = beam_pattern_modified(...
+        r_vs_6dof, vs_centres, mic_positions, array_centre_2d, source_positions(:,1:2), ...
+        bin_freqs, c_0, rho_0, loading, num_bins, N_v, radius, ...
+        sprintf('Modified V_6 (r = %.2f lambda)', dist_lambda));
+    save_figure(fig_6, results_folder, sprintf('%02d_%.2flambda_modified_beam', batch_test_idx, dist_lambda));
+    close(fig_6);
+
+    batch_res_beamwidth_6dof(batch_test_idx) = bm_6.beamwidth_3dB;
+    batch_res_DI_6dof(batch_test_idx) = bm_6.directivity_index;
+    batch_res_sidelobe_6dof(batch_test_idx) = bm_6.sidelobe_level;
+
+    % Pressure-only V_4 beam pattern
+    [~, ~, fig_4, bm_4] = beam_pattern_pressure_only(...
+        r_vs_4dof, vs_centres, mic_positions, array_centre_2d, source_positions(:,1:2), ...
+        bin_freqs, c_0, rho_0, loading, num_bins, N_v, radius, ...
+        sprintf('Pressure-only V_4 (r = %.2f lambda)', dist_lambda));
+    save_figure(fig_4, results_folder, sprintf('%02d_%.2flambda_pressure_only_beam', batch_test_idx, dist_lambda));
+    close(fig_4);
+
+    batch_res_beamwidth_4dof(batch_test_idx) = bm_4.beamwidth_3dB;
+    batch_res_DI_4dof(batch_test_idx) = bm_4.directivity_index;
+    batch_res_sidelobe_4dof(batch_test_idx) = bm_4.sidelobe_level;
+
+
+    % STEP 16: 1D RAY RESPONSE ANALYSIS %
+
+    fprintf('\n<strong>1D RAY RESPONSE ANALYSIS (%.0f deg)</strong>\n', ray_angle_deg);
+
+    [ray_distances, ray_resp_3dof, ray_resp_3dofS, ray_resp_6dof, ray_resp_4dof, ...
+        peak_r_3dof, peak_r_3dofS, peak_r_6dof, peak_r_4dof, ...
+        range_3dB_3dof, range_3dB_3dofS, range_3dB_6dof, range_3dB_4dof, ...
+        saturated_3dof, saturated_3dofS, saturated_6dof, saturated_4dof] = ...
+        ray_response_1d(r_vs_3dof, r_vs_6dof, r_vs_4dof, ...
+        vs_centres, mic_positions, ray_angle_deg, ray_range_lambdas, ...
+        ray_num_points, bin_freqs, c_0, rho_0, loading, num_bins, N_v, lambda);
+
+    batch_res_ray_peak_3dof(batch_test_idx) = peak_r_3dof;
+    batch_res_ray_peak_3dofS(batch_test_idx) = peak_r_3dofS;
+    batch_res_ray_peak_6dof(batch_test_idx) = peak_r_6dof;
+    batch_res_ray_peak_4dof(batch_test_idx) = peak_r_4dof;
+
+    batch_res_range_3dB_3dof(batch_test_idx) = range_3dB_3dof;
+    batch_res_range_3dB_3dofS(batch_test_idx) = range_3dB_3dofS;
+    batch_res_range_3dB_6dof(batch_test_idx) = range_3dB_6dof;
+    batch_res_range_3dB_4dof(batch_test_idx) = range_3dB_4dof;
+    batch_res_saturated_3dof(batch_test_idx) = saturated_3dof;
+    batch_res_saturated_3dofS(batch_test_idx) = saturated_3dofS;
+    batch_res_saturated_6dof(batch_test_idx) = saturated_6dof;
+    batch_res_saturated_4dof(batch_test_idx) = saturated_4dof;
+
+    fprintf('  True source distance: %.4f m (%.2f lambda)\n', source_distance_m, dist_lambda);
+    fprintf('  Peak | -3 dB bracket — Planar V_3:    %.4f m | %.3f lambda %s\n', ...
+        peak_r_3dof, range_3dB_3dof / lambda, sat_label(saturated_3dof));
+    fprintf('  Peak | -3 dB bracket — Spherical V_3: %.4f m | %.3f lambda %s\n', ...
+        peak_r_3dofS, range_3dB_3dofS / lambda, sat_label(saturated_3dofS));
+    fprintf('  Peak | -3 dB bracket — Modified V_6:  %.4f m | %.3f lambda %s\n', ...
+        peak_r_6dof, range_3dB_6dof / lambda, sat_label(saturated_6dof));
+    fprintf('  Peak | -3 dB bracket — PresOnly V_4:  %.4f m | %.3f lambda %s\n', ...
+        peak_r_4dof, range_3dB_4dof / lambda, sat_label(saturated_4dof));
+
+    % Plot 1D ray response
+    fig_ray = plot_ray_response(ray_distances, ray_resp_3dof, ray_resp_3dofS, ...
+        ray_resp_6dof, ray_resp_4dof, source_distance_m, lambda, ray_angle_deg, dist_lambda);
+    save_figure(fig_ray, results_folder, sprintf('%02d_%.2flambda_ray_response', batch_test_idx, dist_lambda));
+    close(fig_ray);
+
+
+    fprintf('\n<strong>Test %d Summary (r = %.2f lambda):</strong>\n', ...
+        batch_test_idx, dist_lambda);
+    fprintf('  Radial error: Planar = %.4f m | Spherical = %.4f m | Modified = %.4f m | PresOnly = %.4f m\n', ...
+        batch_res_radial_error_3dof(batch_test_idx), ...
+        batch_res_radial_error_3dofS(batch_test_idx), ...
+        batch_res_radial_error_6dof(batch_test_idx), ...
+        batch_res_radial_error_4dof(batch_test_idx));
+    fprintf('  Angular error: Planar = %.3f | Spherical = %.3f | Modified = %.3f | PresOnly = %.3f deg\n', ...
+        batch_res_angular_error_3dof(batch_test_idx), ...
+        batch_res_angular_error_3dofS(batch_test_idx), ...
+        batch_res_angular_error_6dof(batch_test_idx), ...
+        batch_res_angular_error_4dof(batch_test_idx));
+    fprintf('  Condition (raw): 3-DOF = %.2e | Modified = %.2e | PresOnly = %.2e\n', ...
+        batch_res_cond_num_3dof(batch_test_idx), ...
+        batch_res_cond_num_6dof(batch_test_idx), ...
+        batch_res_cond_num_4dof(batch_test_idx));
+    fprintf('  Beamwidth: Planar = %.1f | Spherical = %.1f | Modified = %.1f | PresOnly = %.1f deg\n', ...
+        batch_res_beamwidth_3dof(batch_test_idx), ...
+        batch_res_beamwidth_3dofS(batch_test_idx), ...
+        batch_res_beamwidth_6dof(batch_test_idx), ...
+        batch_res_beamwidth_4dof(batch_test_idx));
+    fprintf('  Ray peak: Planar = %.2f | Spherical = %.2f | Modified = %.2f | PresOnly = %.2f lambda\n', ...
+        peak_r_3dof / lambda, peak_r_3dofS / lambda, peak_r_6dof / lambda, peak_r_4dof / lambda);
+
+
+    % STEP 17: SAVE INTERMEDIATE DATA FOR THIS TEST %
+
+    fprintf('\nSaving intermediate data for test %d...\n', batch_test_idx);
+
+    intermediate_mat = fullfile(results_folder, ...
+        sprintf('%02d_%.2flambda_data.mat', batch_test_idx, dist_lambda));
+    save(intermediate_mat, ...
+        'ray_distances', 'ray_resp_3dof', 'ray_resp_3dofS', 'ray_resp_6dof', 'ray_resp_4dof', ...
+        'response_db_3dof', 'response_db_3dofS', 'response_db_6dof', 'response_db_4dof', ...
+        'x_scan', 'y_scan', ...
+        'source_x', 'source_y', 'dist_lambda', 'source_distance_m', 'lambda', ...
+        'bin_freqs', 'num_bins', ...
+        'r_vs_3dof', 'r_vs_6dof', 'r_vs_4dof');
+    fprintf('  Intermediate data saved to: %s\n', intermediate_mat);
+
+
+    close all;
+end
+
+
+%% SAVE RESULTS TO CSV %%
+
+fprintf('\n========================================\n');
+fprintf('<strong>SAVING RESULTS</strong>\n');
+fprintf('========================================\n');
+
+results_table = table(...
+    batch_res_distance_lambda, batch_res_distance_m, ...
+    batch_res_source_x, batch_res_source_y, batch_res_grid_resolution, ...
+    batch_res_radial_error_3dof, batch_res_angular_error_3dof, ...
+    batch_res_radial_error_3dofS, batch_res_angular_error_3dofS, ...
+    batch_res_radial_error_6dof, batch_res_angular_error_6dof, ...
+    batch_res_radial_error_4dof, batch_res_angular_error_4dof, ...
+    batch_res_cond_num_3dof, batch_res_cond_num_loaded_3dof, ...
+    batch_res_cond_num_3dofS, batch_res_cond_num_loaded_3dofS, ...
+    batch_res_cond_num_6dof, batch_res_cond_num_loaded_6dof, ...
+    batch_res_cond_num_4dof, batch_res_cond_num_loaded_4dof, ...
+    batch_res_beamwidth_3dof, batch_res_beamwidth_3dofS, ...
+    batch_res_beamwidth_6dof, batch_res_beamwidth_4dof, ...
+    batch_res_DI_3dof, batch_res_DI_3dofS, batch_res_DI_6dof, batch_res_DI_4dof, ...
+    batch_res_sidelobe_3dof, batch_res_sidelobe_3dofS, ...
+    batch_res_sidelobe_6dof, batch_res_sidelobe_4dof, ...
+    batch_res_ray_peak_3dof, batch_res_ray_peak_3dofS, ...
+    batch_res_ray_peak_6dof, batch_res_ray_peak_4dof, ...
+    batch_res_range_3dB_3dof, batch_res_range_3dB_3dofS, ...
+    batch_res_range_3dB_6dof, batch_res_range_3dB_4dof, ...
+    batch_res_saturated_3dof, batch_res_saturated_3dofS, ...
+    batch_res_saturated_6dof, batch_res_saturated_4dof, ...
+    'VariableNames', {'Distance_Lambda', 'Distance_m', ...
+    'Source_X_m', 'Source_Y_m', 'Grid_Resolution_m', ...
+    'Radial_Error_Planar_m', 'Angular_Error_Planar_deg', ...
+    'Radial_Error_Spherical_m', 'Angular_Error_Spherical_deg', ...
+    'Radial_Error_Modified_m', 'Angular_Error_Modified_deg', ...
+    'Radial_Error_PresOnly_m', 'Angular_Error_PresOnly_deg', ...
+    'Cond_Num_Planar_Raw', 'Cond_Num_Planar_Loaded', ...
+    'Cond_Num_Spherical_Raw', 'Cond_Num_Spherical_Loaded', ...
+    'Cond_Num_Modified_Raw', 'Cond_Num_Modified_Loaded', ...
+    'Cond_Num_PresOnly_Raw', 'Cond_Num_PresOnly_Loaded', ...
+    'Beamwidth_3dB_Planar_deg', 'Beamwidth_3dB_Spherical_deg', ...
+    'Beamwidth_3dB_Modified_deg', 'Beamwidth_3dB_PresOnly_deg', ...
+    'DI_Planar_dB', 'DI_Spherical_dB', 'DI_Modified_dB', 'DI_PresOnly_dB', ...
+    'Sidelobe_Planar_dB', 'Sidelobe_Spherical_dB', ...
+    'Sidelobe_Modified_dB', 'Sidelobe_PresOnly_dB', ...
+    'Ray_Peak_Planar_m', 'Ray_Peak_Spherical_m', ...
+    'Ray_Peak_Modified_m', 'Ray_Peak_PresOnly_m', ...
+    'Range_3dB_Planar_m', 'Range_3dB_Spherical_m', ...
+    'Range_3dB_Modified_m', 'Range_3dB_PresOnly_m', ...
+    'Saturated_Planar', 'Saturated_Spherical', ...
+    'Saturated_Modified', 'Saturated_PresOnly'});
+
+fprintf('\nResults table preview:\n');
+disp(results_table);
+
+csv_filename_out = fullfile(results_folder, 'dist_sweep_results.csv');
+writetable(results_table, csv_filename_out);
+fprintf('\nResults saved to: %s\n', csv_filename_out);
+
+mat_filename_out = fullfile(results_folder, 'dist_sweep_results.mat');
+save(mat_filename_out, 'results_table', 'distance_lambdas', 'batch_test_distances', ...
+    'test_freq', 'lambda', 'delta_fixed', 'c_0', 'rho_0', 'loading', ...
+    'ray_angle_deg', 'ray_range_lambdas');
+fprintf('Results also saved to: %s\n', mat_filename_out);
+
+
+%% PUBLICATION FIGURES — DISTANCE SWEEP RESULTS %%
+
+col_planar    = [0.250, 0.150, 0.040]; %very dark brown — V_3 planar
+col_spherical = [0.550, 0.300, 0.080]; %dark orange-brown — V_3 spherical
+col_modified  = [0.850, 0.450, 0.100]; %medium orange — V_6 modified
+col_presonly  = [1.000, 0.700, 0.350]; %light orange — V_4 pressure-only
+lw = 1.8;
+ms = 7;
+fn = 'Times New Roman';
+fs_ax = 12;
+fs_lab = 14;
+fs_leg = 11;
+
+
+% FIGURE: RADIAL ERROR VS DISTANCE %
+
+figure('Color', 'w', 'Position', [100 100 520 360]);
+semilogy(batch_res_distance_lambda, batch_res_radial_error_3dof, '-o', ...
+    'Color', col_planar, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_planar, 'DisplayName', 'Planar $\mathbf{V}_3$');
+hold on;
+semilogy(batch_res_distance_lambda, batch_res_radial_error_3dofS, '-d', ...
+    'Color', col_spherical, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_spherical, 'DisplayName', 'Spherical $\mathbf{V}_3$');
+semilogy(batch_res_distance_lambda, batch_res_radial_error_6dof, '-s', ...
+    'Color', col_modified, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_modified, 'DisplayName', 'Modified $\mathbf{V}_6$');
+semilogy(batch_res_distance_lambda, batch_res_radial_error_4dof, '-^', ...
+    'Color', col_presonly, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_presonly, 'DisplayName', 'Pressure-only $\mathbf{V}_4$');
+hold off;
+xlabel('Source distance ($r / \lambda$)', 'Interpreter', 'latex', 'FontSize', fs_lab);
+ylabel('Radial error (m)', 'FontName', fn, 'FontSize', fs_lab);
+legend('Location', 'southeast', 'FontName', fn, 'FontSize', fs_leg, ...
+    'Interpreter', 'latex', 'Box', 'on');
+set(gca, 'FontName', fn, 'FontSize', fs_ax, ...
+    'XTick', distance_lambdas, 'LineWidth', 1.0, 'Box', 'on', ...
+    'YGrid', 'on', 'XGrid', 'off');
+save_figure(gcf, results_folder, 'radial_error_vs_distance');
+
+
+% FIGURE: ANGULAR ERROR VS DISTANCE %
+
+figure('Color', 'w', 'Position', [100 100 520 360]);
+plot(batch_res_distance_lambda, batch_res_angular_error_3dof, '-o', ...
+    'Color', col_planar, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_planar, 'DisplayName', 'Planar $\mathbf{V}_3$');
+hold on;
+plot(batch_res_distance_lambda, batch_res_angular_error_3dofS, '-d', ...
+    'Color', col_spherical, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_spherical, 'DisplayName', 'Spherical $\mathbf{V}_3$');
+plot(batch_res_distance_lambda, batch_res_angular_error_6dof, '-s', ...
+    'Color', col_modified, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_modified, 'DisplayName', 'Modified $\mathbf{V}_6$');
+plot(batch_res_distance_lambda, batch_res_angular_error_4dof, '-^', ...
+    'Color', col_presonly, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_presonly, 'DisplayName', 'Pressure-only $\mathbf{V}_4$');
+hold off;
+xlabel('Source distance ($r / \lambda$)', 'Interpreter', 'latex', 'FontSize', fs_lab);
+ylabel('Angular error (deg)', 'FontName', fn, 'FontSize', fs_lab);
+legend('Location', 'southeast', 'FontName', fn, 'FontSize', fs_leg, ...
+    'Interpreter', 'latex', 'Box', 'on');
+set(gca, 'FontName', fn, 'FontSize', fs_ax, ...
+    'XTick', distance_lambdas, 'LineWidth', 1.0, 'Box', 'on', ...
+    'YGrid', 'on', 'XGrid', 'off');
+save_figure(gcf, results_folder, 'angular_error_vs_distance');
+
+
+% FIGURE: CONDITION NUMBER VS DISTANCE (2x1 PANEL) %
+% Note: Planar and Spherical V_3 share the same 3-DOF CSM, so their
+% condition number curves overlap exactly. Both plotted for completeness.
+
+figure('Color', 'w', 'Position', [100 100 520 600]);
+
+subplot(2,1,1);
+semilogy(batch_res_distance_lambda, batch_res_cond_num_3dof, '-o', ...
+    'Color', col_planar, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_planar, 'DisplayName', 'Planar/Spherical $\mathbf{V}_3$ (3x3)');
+hold on;
+semilogy(batch_res_distance_lambda, batch_res_cond_num_6dof, '-s', ...
+    'Color', col_modified, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_modified, 'DisplayName', 'Modified $\mathbf{V}_6$ (6x6)');
+semilogy(batch_res_distance_lambda, batch_res_cond_num_4dof, '-^', ...
+    'Color', col_presonly, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_presonly, 'DisplayName', 'Pres-only $\mathbf{V}_4$ (4x4)');
+hold off;
+ylabel('Condition number (raw)', 'FontName', fn, 'FontSize', fs_lab);
+legend('Location', 'southeast', 'FontName', fn, 'FontSize', fs_leg, ...
+    'Interpreter', 'latex', 'Box', 'on');
+set(gca, 'FontName', fn, 'FontSize', fs_ax, ...
+    'XTick', distance_lambdas, 'XTickLabel', {}, ...
+    'LineWidth', 1.0, 'Box', 'on', 'YGrid', 'on', 'XGrid', 'off');
+title('CSM Condition Number vs Source Distance', 'FontName', fn, 'FontSize', 14);
+
+subplot(2,1,2);
+semilogy(batch_res_distance_lambda, batch_res_cond_num_loaded_3dof, '-o', ...
+    'Color', col_planar, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_planar, 'DisplayName', 'Planar/Spherical $\mathbf{V}_3$ (3x3)');
+hold on;
+semilogy(batch_res_distance_lambda, batch_res_cond_num_loaded_6dof, '-s', ...
+    'Color', col_modified, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_modified, 'DisplayName', 'Modified $\mathbf{V}_6$ (6x6)');
+semilogy(batch_res_distance_lambda, batch_res_cond_num_loaded_4dof, '-^', ...
+    'Color', col_presonly, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_presonly, 'DisplayName', 'Pres-only $\mathbf{V}_4$ (4x4)');
+hold off;
+xlabel('Source distance ($r / \lambda$)', 'Interpreter', 'latex', 'FontSize', fs_lab);
+ylabel('Condition number (loaded)', 'FontName', fn, 'FontSize', fs_lab);
+legend('Location', 'southeast', 'FontName', fn, 'FontSize', fs_leg, ...
+    'Interpreter', 'latex', 'Box', 'on');
+set(gca, 'FontName', fn, 'FontSize', fs_ax, ...
+    'XTick', distance_lambdas, 'LineWidth', 1.0, 'Box', 'on', ...
+    'YGrid', 'on', 'XGrid', 'off');
+
+save_figure(gcf, results_folder, 'condition_number_vs_distance');
+
+
+% FIGURE: BEAMWIDTH AND DI VS DISTANCE (2x1 PANEL) %
+
+figure('Color', 'w', 'Position', [100 100 520 600]);
+
+subplot(2,1,1);
+plot(batch_res_distance_lambda, batch_res_beamwidth_3dof, '-o', ...
+    'Color', col_planar, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_planar, 'DisplayName', 'Planar $\mathbf{V}_3$');
+hold on;
+plot(batch_res_distance_lambda, batch_res_beamwidth_3dofS, '-d', ...
+    'Color', col_spherical, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_spherical, 'DisplayName', 'Spherical $\mathbf{V}_3$');
+plot(batch_res_distance_lambda, batch_res_beamwidth_6dof, '-s', ...
+    'Color', col_modified, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_modified, 'DisplayName', 'Modified $\mathbf{V}_6$');
+plot(batch_res_distance_lambda, batch_res_beamwidth_4dof, '-^', ...
+    'Color', col_presonly, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_presonly, 'DisplayName', 'Pressure-only $\mathbf{V}_4$');
+hold off;
+ylabel('$-3\,\mathrm{dB}$ beamwidth (deg)', 'Interpreter', 'latex', 'FontSize', fs_lab);
+legend('Location', 'northeast', 'FontName', fn, 'FontSize', fs_leg, ...
+    'Interpreter', 'latex', 'Box', 'on');
+set(gca, 'FontName', fn, 'FontSize', fs_ax, ...
+    'XTick', distance_lambdas, 'XTickLabel', {}, ...
+    'LineWidth', 1.0, 'Box', 'on', 'YGrid', 'on', 'XGrid', 'off');
+
+subplot(2,1,2);
+plot(batch_res_distance_lambda, batch_res_DI_3dof, '-o', ...
+    'Color', col_planar, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_planar, 'DisplayName', 'Planar $\mathbf{V}_3$');
+hold on;
+plot(batch_res_distance_lambda, batch_res_DI_3dofS, '-d', ...
+    'Color', col_spherical, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_spherical, 'DisplayName', 'Spherical $\mathbf{V}_3$');
+plot(batch_res_distance_lambda, batch_res_DI_6dof, '-s', ...
+    'Color', col_modified, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_modified, 'DisplayName', 'Modified $\mathbf{V}_6$');
+plot(batch_res_distance_lambda, batch_res_DI_4dof, '-^', ...
+    'Color', col_presonly, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_presonly, 'DisplayName', 'Pressure-only $\mathbf{V}_4$');
+hold off;
+xlabel('Source distance ($r / \lambda$)', 'Interpreter', 'latex', 'FontSize', fs_lab);
+ylabel('Directivity index (dB)', 'FontName', fn, 'FontSize', fs_lab);
+legend('Location', 'northeast', 'FontName', fn, 'FontSize', fs_leg, ...
+    'Interpreter', 'latex', 'Box', 'on');
+set(gca, 'FontName', fn, 'FontSize', fs_ax, ...
+    'XTick', distance_lambdas, 'LineWidth', 1.0, 'Box', 'on', ...
+    'YGrid', 'on', 'XGrid', 'off');
+
+save_figure(gcf, results_folder, 'beamwidth_DI_vs_distance');
+
+
+% FIGURE: 1D RAY PEAK DISTANCE VS TRUE DISTANCE %
+
+figure('Color', 'w', 'Position', [100 100 520 360]);
+plot(batch_res_distance_lambda, batch_res_ray_peak_3dof / lambda, '-o', ...
+    'Color', col_planar, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_planar, 'DisplayName', 'Planar $\mathbf{V}_3$');
+hold on;
+plot(batch_res_distance_lambda, batch_res_ray_peak_3dofS / lambda, '-d', ...
+    'Color', col_spherical, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_spherical, 'DisplayName', 'Spherical $\mathbf{V}_3$');
+plot(batch_res_distance_lambda, batch_res_ray_peak_6dof / lambda, '-s', ...
+    'Color', col_modified, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_modified, 'DisplayName', 'Modified $\mathbf{V}_6$');
+plot(batch_res_distance_lambda, batch_res_ray_peak_4dof / lambda, '-^', ...
+    'Color', col_presonly, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_presonly, 'DisplayName', 'Pressure-only $\mathbf{V}_4$');
+plot(batch_res_distance_lambda, batch_res_distance_lambda, 'k--', ...
+    'LineWidth', 1.2, 'DisplayName', 'True distance');
+hold off;
+xlabel('True source distance ($r / \lambda$)', 'Interpreter', 'latex', 'FontSize', fs_lab);
+ylabel('Ray peak distance ($r / \lambda$)', 'Interpreter', 'latex', 'FontSize', fs_lab);
+legend('Location', 'northeast', 'FontName', fn, 'FontSize', fs_leg, ...
+    'Interpreter', 'latex', 'Box', 'on');
+set(gca, 'FontName', fn, 'FontSize', fs_ax, ...
+    'XTick', distance_lambdas, 'LineWidth', 1.0, 'Box', 'on', ...
+    'YGrid', 'on', 'XGrid', 'off');
+save_figure(gcf, results_folder, 'ray_peak_vs_distance');
+
+
+% FIGURE: -3 dB RANGE BRACKET VS DISTANCE — peak sharpness %
+
+figure('Color', 'w', 'Position', [100 100 520 360]);
+semilogy(batch_res_distance_lambda, batch_res_range_3dB_3dof / lambda, '-o', ...
+    'Color', col_planar, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_planar, 'DisplayName', 'Planar $\mathbf{V}_3$');
+hold on;
+semilogy(batch_res_distance_lambda, batch_res_range_3dB_3dofS / lambda, '-d', ...
+    'Color', col_spherical, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_spherical, 'DisplayName', 'Spherical $\mathbf{V}_3$');
+semilogy(batch_res_distance_lambda, batch_res_range_3dB_6dof / lambda, '-s', ...
+    'Color', col_modified, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_modified, 'DisplayName', 'Modified $\mathbf{V}_6$');
+semilogy(batch_res_distance_lambda, batch_res_range_3dB_4dof / lambda, '-^', ...
+    'Color', col_presonly, 'LineWidth', lw, 'MarkerSize', ms, ...
+    'MarkerFaceColor', col_presonly, 'DisplayName', 'Pressure-only $\mathbf{V}_4$');
+
+% Mark the search range upper bound — bracket saturating to this means
+% no range resolution
+search_extent = ray_range_lambdas(2) - ray_range_lambdas(1);
+yline(search_extent, 'k:', 'LineWidth', 1.2, ...
+    'DisplayName', 'Search range (saturation)', 'HandleVisibility', 'on');
+
+hold off;
+xlabel('Source distance ($r / \lambda$)', 'Interpreter', 'latex', 'FontSize', fs_lab);
+ylabel('$-3\,\mathrm{dB}$ range bracket ($\Delta r / \lambda$)', ...
+    'Interpreter', 'latex', 'FontSize', fs_lab);
+legend('Location', 'southeast', 'FontName', fn, 'FontSize', fs_leg, ...
+    'Interpreter', 'latex', 'Box', 'on');
+set(gca, 'FontName', fn, 'FontSize', fs_ax, ...
+    'XTick', distance_lambdas, 'LineWidth', 1.0, 'Box', 'on', ...
+    'YGrid', 'on', 'XGrid', 'off');
+save_figure(gcf, results_folder, 'range_3dB_bracket_vs_distance');
+
+
+%% FINAL SUMMARY %%
+
+fprintf('\n========================================\n');
+fprintf('<strong>DISTANCE SWEEP TEST COMPLETE</strong>\n');
+fprintf('========================================\n');
+
+fprintf('\n%-14s %-14s %-14s %-14s %-14s\n', 'Dist (lambda)', ...
+    'Planar Rad', 'Spherical Rad', 'Modified Rad', 'PresOnly Rad');
+fprintf('%s\n', repmat('-', 1, 75));
+for i = 1:batch_num_tests
+    fprintf('%-14.2f %-14.4f %-14.4f %-14.4f %-14.4f\n', ...
+        batch_res_distance_lambda(i), ...
+        batch_res_radial_error_3dof(i), ...
+        batch_res_radial_error_3dofS(i), ...
+        batch_res_radial_error_6dof(i), ...
+        batch_res_radial_error_4dof(i));
+end
+fprintf('%s\n', repmat('-', 1, 75));
+
+fprintf('\n%-14s %-14s %-14s %-14s %-14s\n', 'Dist (lambda)', ...
+    'Planar Ang', 'Spherical Ang', 'Modified Ang', 'PresOnly Ang');
+fprintf('%s\n', repmat('-', 1, 75));
+for i = 1:batch_num_tests
+    fprintf('%-14.2f %-14.3f %-14.3f %-14.3f %-14.3f\n', ...
+        batch_res_distance_lambda(i), ...
+        batch_res_angular_error_3dof(i), ...
+        batch_res_angular_error_3dofS(i), ...
+        batch_res_angular_error_6dof(i), ...
+        batch_res_angular_error_4dof(i));
+end
+fprintf('%s\n', repmat('-', 1, 75));
+
+fprintf('\n%-14s %-16s %-16s %-16s\n', 'Dist (lambda)', ...
+    '3-DOF Cond', 'Modified Cond', 'PresOnly Cond');
+fprintf('%s\n', repmat('-', 1, 64));
+for i = 1:batch_num_tests
+    fprintf('%-14.2f %-16.2e %-16.2e %-16.2e\n', ...
+        batch_res_distance_lambda(i), ...
+        batch_res_cond_num_3dof(i), ...
+        batch_res_cond_num_6dof(i), ...
+        batch_res_cond_num_4dof(i));
+end
+fprintf('%s\n', repmat('-', 1, 64));
+
+fprintf('\n%-14s %-14s %-14s %-14s %-14s\n', 'Dist (lambda)', ...
+    'Planar BW', 'Spherical BW', 'Modified BW', 'PresOnly BW');
+fprintf('%s\n', repmat('-', 1, 75));
+for i = 1:batch_num_tests
+    fprintf('%-14.2f %-14.1f %-14.1f %-14.1f %-14.1f\n', ...
+        batch_res_distance_lambda(i), ...
+        batch_res_beamwidth_3dof(i), ...
+        batch_res_beamwidth_3dofS(i), ...
+        batch_res_beamwidth_6dof(i), ...
+        batch_res_beamwidth_4dof(i));
+end
+fprintf('%s\n', repmat('-', 1, 75));
+
+fprintf('\n%-14s %-14s %-14s %-14s %-14s\n', 'Dist (lambda)', ...
+    'Planar RayPk', 'Spherical RayPk', 'Modified RayPk', 'PresOnly RayPk');
+fprintf('%s\n', repmat('-', 1, 75));
+for i = 1:batch_num_tests
+    fprintf('%-14.2f %-14.4f %-14.4f %-14.4f %-14.4f\n', ...
+        batch_res_distance_lambda(i), ...
+        batch_res_ray_peak_3dof(i), ...
+        batch_res_ray_peak_3dofS(i), ...
+        batch_res_ray_peak_6dof(i), ...
+        batch_res_ray_peak_4dof(i));
+end
+fprintf('%s\n', repmat('-', 1, 75));
+
+fprintf('\nAll results saved to: %s\n\n', results_folder);
+
+
+%% FUNCTION DEFINITIONS %%
+% Function definitions kept in this section so the script remains
+% self-contained.
+
+
+%% save_figure
+function save_figure(fig_handle, results_folder, base_name)
+    exportgraphics(fig_handle, fullfile(results_folder, [base_name, '.png']), 'ContentType', 'image');
+    exportgraphics(fig_handle, fullfile(results_folder, [base_name, '.pdf']), 'ContentType', 'vector');
+    savefig(fig_handle, fullfile(results_folder, [base_name, '.fig']));
+end
+
+
+%% make_snapshots
+function snapshots = make_snapshots(tx_vs, size_fft, overlap, window)
+    step = round(overlap * size_fft);
+    num_snap = floor((size(tx_vs, 2) - size_fft) / step) + 1;
+    start_idx = 1 + (0:(num_snap - 1)) * step;
+    idx_matrix = start_idx + (0:size_fft - 1)';
+    snapshots = tx_vs(:, idx_matrix);
+    snapshots = reshape(snapshots, size(tx_vs, 1), size_fft, num_snap);
+    snapshots = snapshots .* reshape(window, [1, size_fft, 1]);
+end
+
+
+%% create_csm_baseline
+% 3-DOF data CSM — used by both Planar and Spherical V_3 steering vectors
+function r_vs = create_csm_baseline(snapshots_vs, bin_index, delta, bin_freqs, rho_0, N_v, num_bins, c_0)
+    signal_dim = 3 * N_v;
+    fx = fft(snapshots_vs, [], 2);
+    fx = fx(:, bin_index, :);
+    r_vs = zeros(signal_dim, signal_dim, num_bins);
+    num_snap = size(snapshots_vs, 3);
+    for jf = 1:num_bins
+        freq = bin_freqs(jf);
+        fx_bin = squeeze(fx(:, jf, :));
+        R_freq = zeros(signal_dim, signal_dim);
+        for snap = 1:num_snap
+            fx_snap = fx_bin(:, snap);
+            [p_vs, vx_vs, vy_vs] = vs_outputs_baseline(fx_snap, delta, freq, rho_0, N_v, c_0);
+            rho_c = rho_0 * c_0;
+            vx_vs = rho_c * vx_vs;
+            vy_vs = rho_c * vy_vs;
+            vs_signal = zeros(signal_dim, 1);
+            for n = 1:N_v
+                idx = (n - 1) * 3 + (1:3);
+                vs_signal(idx) = [p_vs(n); vx_vs(n); vy_vs(n)];
+            end
+            R_freq = R_freq + (vs_signal * vs_signal');
+        end
+        r_vs(:,:,jf) = R_freq / num_snap;
+    end
+end
+
+
+%% create_csm_modified
+function r_vs = create_csm_modified(snapshots_vs, bin_index, delta, bin_freqs, rho_0, N_v, num_bins, c_0)
+    signal_dim = 6 * N_v;
+    fx = fft(snapshots_vs, [], 2);
+    fx = fx(:, bin_index, :);
+    r_vs = zeros(signal_dim, signal_dim, num_bins);
+    num_snap = size(snapshots_vs, 3);
+    for jf = 1:num_bins
+        freq = bin_freqs(jf);
+        fx_bin = squeeze(fx(:, jf, :));
+        R_freq = zeros(signal_dim, signal_dim);
+        for snap = 1:num_snap
+            fx_snap = fx_bin(:, snap);
+            [p1, p2, p3, p4, vx_vs, vy_vs] = vs_outputs_modified(fx_snap, delta, freq, rho_0, N_v, c_0);
+            rho_c = rho_0 * c_0;
+            vx_vs = rho_c * vx_vs;
+            vy_vs = rho_c * vy_vs;
+            vs_signal = zeros(signal_dim, 1);
+            for n = 1:N_v
+                idx = (n - 1) * 6 + (1:6);
+                vs_signal(idx) = [p1(n); p2(n); p3(n); p4(n); vx_vs(n); vy_vs(n)];
+            end
+            R_freq = R_freq + (vs_signal * vs_signal');
+        end
+        r_vs(:,:,jf) = R_freq / num_snap;
+    end
+end
+
+
+%% create_csm_pressure_only
+function r_vs = create_csm_pressure_only(snapshots_vs, bin_index, delta, bin_freqs, rho_0, N_v, num_bins, c_0)
+    signal_dim = 4 * N_v;
+    fx = fft(snapshots_vs, [], 2);
+    fx = fx(:, bin_index, :);
+    r_vs = zeros(signal_dim, signal_dim, num_bins);
+    num_snap = size(snapshots_vs, 3);
+    for jf = 1:num_bins
+        fx_bin = squeeze(fx(:, jf, :));
+        R_freq = zeros(signal_dim, signal_dim);
+        for snap = 1:num_snap
+            fx_snap = fx_bin(:, snap);
+            vs_signal = zeros(signal_dim, 1);
+            for n = 1:N_v
+                mic_idx = (n - 1) * 4 + (1:4);
+                sig_idx = (n - 1) * 4 + (1:4);
+                vs_signal(sig_idx) = fx_snap(mic_idx);
+            end
+            R_freq = R_freq + (vs_signal * vs_signal');
+        end
+        r_vs(:,:,jf) = R_freq / num_snap;
+    end
+end
+
+
+%% vs_outputs_baseline
+function [p_vs, vx_vs, vy_vs] = vs_outputs_baseline(tx_freq, delta, freq, rho_0, N_v, c_0)
+    omega = 2 * pi * freq;
+    p_vs = zeros(N_v, 1);
+    vx_vs = zeros(N_v, 1);
+    vy_vs = zeros(N_v, 1);
+    for vs = 1:N_v
+        idx = (vs - 1) * 4 + (1:4);
+        mic_pos = [-delta/2, -delta/2;
+                    delta/2, -delta/2;
+                    delta/2,  delta/2;
+                   -delta/2,  delta/2];
+        M = [ones(4, 1), mic_pos];
+        p_vector = tx_freq(idx);
+        coeffs = M \ p_vector;
+        p_vs(vs) = coeffs(1);
+        vx_vs(vs) = -coeffs(2) / (1i * omega * rho_0);
+        vy_vs(vs) = -coeffs(3) / (1i * omega * rho_0);
+    end
+end
+
+
+%% vs_outputs_modified
+function [p1, p2, p3, p4, vx_vs, vy_vs] = vs_outputs_modified(tx_freq, delta, freq, rho_0, N_v, c_0)
+    omega = 2 * pi * freq;
+    p1 = zeros(N_v, 1);
+    p2 = zeros(N_v, 1);
+    p3 = zeros(N_v, 1);
+    p4 = zeros(N_v, 1);
+    vx_vs = zeros(N_v, 1);
+    vy_vs = zeros(N_v, 1);
+    for vs = 1:N_v
+        idx = (vs - 1) * 4 + (1:4);
+        mic_pos = [-delta/2, -delta/2;
+                    delta/2, -delta/2;
+                    delta/2,  delta/2;
+                   -delta/2,  delta/2];
+        p_vector = tx_freq(idx);
+        p1(vs) = p_vector(1);
+        p2(vs) = p_vector(2);
+        p3(vs) = p_vector(3);
+        p4(vs) = p_vector(4);
+        M = [ones(4, 1), mic_pos];
+        coeffs = M \ p_vector;
+        vx_vs(vs) = -coeffs(2) / (1i * omega * rho_0);
+        vy_vs(vs) = -coeffs(3) / (1i * omega * rho_0);
+    end
+end
+
+
+%% steering_vector_baseline
+% Eq. 5 form — far-field plane-wave (range-independent)
+function v_vs = steering_vector_baseline(vs_centres, source_pos, freq, c_0, rho_0, N_v)
+    v_vs = zeros(3 * N_v, 1);
+    for n = 1:N_v
+        r_vec = vs_centres(1:2, n) - source_pos(1:2);
+        theta = atan2(r_vec(2), r_vec(1));
+        idx = (n - 1) * 3 + (1:3);
+        v_vs(idx) = [1; cos(theta); sin(theta)];
+    end
+    v_vs = v_vs / norm(v_vs);
+end
+
+
+%% steering_vector_spherical
+% Eq. 15 form — 3-component near-field spherical-wave steering vector
+% Pressure: full Green's function evaluated at the AVS centre
+% Velocity: Euler's-equation NF correction (1 + jkR) at the AVS centre
+function v_vs = steering_vector_spherical(vs_centres, source_pos, freq, c_0, rho_0, N_v)
+    k = 2 * pi * freq / c_0;
+    omega = 2 * pi * freq;
+    v_vs = zeros(3 * N_v, 1);
+    for n = 1:N_v
+        r_vec = vs_centres(:, n) - source_pos;
+        R = norm(r_vec);
+        r_hat = r_vec / R;
+
+        p_steer = exp(-1i * k * R) / R;
+        common_term = exp(-1i * k * R) / (1i * omega * rho_0 * R^2);
+        rho_c = rho_0 * c_0;
+        vx_steer = rho_c * common_term * (1 + 1i * k * R) * r_hat(1);
+        vy_steer = rho_c * common_term * (1 + 1i * k * R) * r_hat(2);
+
+        idx = (n - 1) * 3 + (1:3);
+        v_vs(idx) = [p_steer; vx_steer; vy_steer];
+    end
+    v_vs = v_vs / norm(v_vs);
+end
+
+
+% %% steering_vector_modified
+% function v_vs = steering_vector_modified(vs_centres, mic_positions, source_pos, freq, c_0, rho_0, N_v)
+%     k = 2 * pi * freq / c_0;
+%     v_vs = zeros(6 * N_v, 1);
+%     for n = 1:N_v
+%         % Compute centre-of-array geometry for this AVS first
+%         r_vec_centre = vs_centres(:, n) - source_pos;
+%         R_centre = norm(r_vec_centre);
+%         theta = atan2(r_vec_centre(2), r_vec_centre(1));
+% 
+%         % Near-field velocity reactance factor
+%         nf_factor = 1 + 1/(1i * k * R_centre);
+% 
+%         % Pressure entries from per-mic Green's function (pos 1-4)
+%         mic_idx = (n - 1) * 4 + (1:4);
+%         for m = 1:4
+%             R_n = norm(mic_positions(:, mic_idx(m)) - source_pos);
+%             v_vs((n - 1) * 6 + m) = exp(-1i * k * R_n) / R_n;
+%         end
+% 
+%         % Velocity entries — near-field corrected (pos 5-6)
+%         v_vs((n - 1) * 6 + 5) = nf_factor * cos(theta) * exp(-1i * k * R_centre) / R_centre;
+%         v_vs((n - 1) * 6 + 6) = nf_factor * sin(theta) * exp(-1i * k * R_centre) / R_centre;
+%     end
+%     v_vs = v_vs / norm(v_vs);
+% end
+
+%% steering_vector_modified — corrected
+function v_vs = steering_vector_modified(vs_centres, mic_positions, source_pos, freq, c_0, rho_0, N_v)
+    k = 2 * pi * freq / c_0;
+    omega = 2 * pi * freq;
+    v_vs = zeros(6 * N_v, 1);
+    for n = 1:N_v
+        % Centre-of-array geometry
+        r_vec_centre = vs_centres(:, n) - source_pos;
+        R_centre = norm(r_vec_centre);
+        r_hat = r_vec_centre / R_centre;
+
+        % Per-mic pressure entries (positions 1-4)
+        mic_idx = (n - 1) * 4 + (1:4);
+        for m = 1:4
+            R_n = norm(mic_positions(:, mic_idx(m)) - source_pos);
+            v_vs((n - 1) * 6 + m) = exp(-1i * k * R_n) / R_n;
+        end
+
+        % Velocity entries — physically consistent with Spherical V_3
+        % (full Euler near-field form)
+        common_term = exp(-1i * k * R_centre) / (1i * omega * rho_0 * R_centre^2);
+        rho_c = rho_0 * c_0;
+        v_vs((n - 1) * 6 + 5) = rho_c * common_term * (1 + 1i * k * R_centre) * r_hat(1);
+        v_vs((n - 1) * 6 + 6) = rho_c * common_term * (1 + 1i * k * R_centre) * r_hat(2);
+    end
+    v_vs = v_vs / norm(v_vs);
+end
+
+%% steering_vector_pressure_only
+function v_vs = steering_vector_pressure_only(vs_centres, mic_positions, source_pos, freq, c_0, rho_0, N_v)
+    k = 2 * pi * freq / c_0;
+    v_vs = zeros(4 * N_v, 1);
+    for n = 1:N_v
+        mic_idx = (n - 1) * 4 + (1:4);
+        for m = 1:4
+            r_vec_mic = mic_positions(:, mic_idx(m)) - source_pos;
+            R_n = norm(r_vec_mic);
+            v_vs((n - 1) * 4 + m) = exp(-1i * k * R_n) / R_n;
+        end
+    end
+    v_vs = v_vs / norm(v_vs);
+end
+
+
+%% mvdr_baseline — Planar V_3 (Eq 5)
+function response_db = mvdr_baseline(r_vs, vs_centres, candidate_points, ...
+    bin_freqs, c_0, rho_0, loading, num_bins, N_v)
+    num_points = size(candidate_points, 1);
+    mvdr_responses = zeros(num_points, num_bins);
+    for jf = 1:num_bins
+        freq = bin_freqs(jf);
+        rf = squeeze(r_vs(:,:,jf));
+        [ur, er] = eig(rf);
+        erv = real(diag(er));
+        erv = max(erv, 1e-12);
+        lambda = loading * max(erv);
+        for n = 1:num_points
+            source_pos = candidate_points(n,:).';
+            v_vs = steering_vector_baseline(vs_centres, source_pos, freq, c_0, rho_0, N_v);
+            rxv = (ur * diag(1 ./ (erv + lambda)) * ur') * v_vs;
+            denominator = v_vs' * rxv;
+            if abs(denominator) > 1e-12
+                vmvdr = rxv / denominator;
+                mvdr_responses(n, jf) = abs(vmvdr' * rf * vmvdr);
+            end
+        end
+    end
+    responses_sum = sum(mvdr_responses, 2);
+    response_db = 10 * log10(responses_sum + eps);
+    response_db = response_db - max(response_db);
+end
+
+
+%% mvdr_spherical — Spherical V_3 (Eq 15)
+function response_db = mvdr_spherical(r_vs, vs_centres, candidate_points, ...
+    bin_freqs, c_0, rho_0, loading, num_bins, N_v)
+    num_points = size(candidate_points, 1);
+    mvdr_responses = zeros(num_points, num_bins);
+    for jf = 1:num_bins
+        freq = bin_freqs(jf);
+        rf = squeeze(r_vs(:,:,jf));
+        [ur, er] = eig(rf);
+        erv = real(diag(er));
+        erv = max(erv, 1e-12);
+        lambda = loading * max(erv);
+        for n = 1:num_points
+            source_pos = candidate_points(n,:).';
+            v_vs = steering_vector_spherical(vs_centres, source_pos, freq, c_0, rho_0, N_v);
+            rxv = (ur * diag(1 ./ (erv + lambda)) * ur') * v_vs;
+            denominator = v_vs' * rxv;
+            if abs(denominator) > 1e-12
+                vmvdr = rxv / denominator;
+                mvdr_responses(n, jf) = abs(vmvdr' * rf * vmvdr);
+            end
+        end
+    end
+    responses_sum = sum(mvdr_responses, 2);
+    response_db = 10 * log10(responses_sum + eps);
+    response_db = response_db - max(response_db);
+end
+
+
+%% mvdr_modified
+function response_db = mvdr_modified(r_vs, vs_centres, mic_positions, ...
+    candidate_points, bin_freqs, c_0, rho_0, loading, num_bins, N_v)
+    num_points = size(candidate_points, 1);
+    mvdr_responses = zeros(num_points, num_bins);
+    for jf = 1:num_bins
+        freq = bin_freqs(jf);
+        rf = squeeze(r_vs(:,:,jf));
+        [ur, er] = eig(rf);
+        erv = real(diag(er));
+        erv = max(erv, 1e-12);
+        lambda = loading * max(erv);
+        for n = 1:num_points
+            source_pos = candidate_points(n,:).';
+            v_vs = steering_vector_modified(vs_centres, mic_positions, source_pos, freq, c_0, rho_0, N_v);
+            rxv = (ur * diag(1 ./ (erv + lambda)) * ur') * v_vs;
+            denominator = v_vs' * rxv;
+            if abs(denominator) > 1e-12
+                vmvdr = rxv / denominator;
+                mvdr_responses(n, jf) = abs(vmvdr' * rf * vmvdr);
+            end
+        end
+    end
+    responses_sum = sum(mvdr_responses, 2);
+    response_db = 10 * log10(responses_sum + eps);
+    response_db = response_db - max(response_db);
+end
+
+
+%% mvdr_pressure_only
+function response_db = mvdr_pressure_only(r_vs, vs_centres, mic_positions, ...
+    candidate_points, bin_freqs, c_0, rho_0, loading, num_bins, N_v)
+    num_points = size(candidate_points, 1);
+    mvdr_responses = zeros(num_points, num_bins);
+    for jf = 1:num_bins
+        freq = bin_freqs(jf);
+        rf = squeeze(r_vs(:,:,jf));
+        [ur, er] = eig(rf);
+        erv = real(diag(er));
+        erv = max(erv, 1e-12);
+        lambda = loading * max(erv);
+        for n = 1:num_points
+            source_pos = candidate_points(n,:).';
+            v_vs = steering_vector_pressure_only(vs_centres, mic_positions, source_pos, freq, c_0, rho_0, N_v);
+            rxv = (ur * diag(1 ./ (erv + lambda)) * ur') * v_vs;
+            denominator = v_vs' * rxv;
+            if abs(denominator) > 1e-12
+                vmvdr = rxv / denominator;
+                mvdr_responses(n, jf) = abs(vmvdr' * rf * vmvdr);
+            end
+        end
+    end
+    responses_sum = sum(mvdr_responses, 2);
+    response_db = 10 * log10(responses_sum + eps);
+    response_db = response_db - max(response_db);
+end
+
+
+%% ray_response_1d
+function [ray_distances, ray_resp_3dof, ray_resp_3dofS, ray_resp_6dof, ray_resp_4dof, ...
+    peak_r_3dof, peak_r_3dofS, peak_r_6dof, peak_r_4dof, ...
+    range_3dB_3dof, range_3dB_3dofS, range_3dB_6dof, range_3dB_4dof, ...
+    saturated_3dof, saturated_3dofS, saturated_6dof, saturated_4dof] = ...
+    ray_response_1d(r_vs_3dof, r_vs_6dof, r_vs_4dof, ...
+    vs_centres, mic_positions, ray_angle_deg, ray_range_lambdas, ...
+    ray_num_points, bin_freqs, c_0, rho_0, loading, num_bins, N_v, lambda)
+
+    r_min = ray_range_lambdas(1) * lambda;
+    r_max = ray_range_lambdas(2) * lambda;
+    ray_distances = linspace(r_min, r_max, ray_num_points);
+
+    ray_x = ray_distances * cosd(ray_angle_deg);
+    ray_y = ray_distances * sind(ray_angle_deg);
+    ray_points = [ray_x(:), ray_y(:), zeros(ray_num_points, 1)];
+
+    ray_resp_3dof = mvdr_baseline(r_vs_3dof, vs_centres, ray_points, ...
+        bin_freqs, c_0, rho_0, loading, num_bins, N_v);
+    ray_resp_3dofS = mvdr_spherical(r_vs_3dof, vs_centres, ray_points, ...
+        bin_freqs, c_0, rho_0, loading, num_bins, N_v);
+    ray_resp_6dof = mvdr_modified(r_vs_6dof, vs_centres, mic_positions, ray_points, ...
+        bin_freqs, c_0, rho_0, loading, num_bins, N_v);
+    ray_resp_4dof = mvdr_pressure_only(r_vs_4dof, vs_centres, mic_positions, ray_points, ...
+        bin_freqs, c_0, rho_0, loading, num_bins, N_v);
+
+    [peak_r_3dof,  range_3dB_3dof,  ~, ~, saturated_3dof]  = analyse_ray_peak(ray_distances, ray_resp_3dof);
+    [peak_r_3dofS, range_3dB_3dofS, ~, ~, saturated_3dofS] = analyse_ray_peak(ray_distances, ray_resp_3dofS);
+    [peak_r_6dof,  range_3dB_6dof,  ~, ~, saturated_6dof]  = analyse_ray_peak(ray_distances, ray_resp_6dof);
+    [peak_r_4dof,  range_3dB_4dof,  ~, ~, saturated_4dof]  = analyse_ray_peak(ray_distances, ray_resp_4dof);
+end
+
+
+%% analyse_ray_peak — peak location plus -3 dB range bracket
+function [peak_r, range_3dB, r_lower_3dB, r_upper_3dB, saturated] = ...
+    analyse_ray_peak(distances, response_db)
+
+    [pk_val, pk_idx] = max(response_db);
+
+    % Sub-pixel peak location via parabolic refinement
+    if pk_idx < 2 || pk_idx > length(distances) - 1
+        peak_r = distances(pk_idx);
+    else
+        dr = distances(2) - distances(1);
+        f_m = response_db(pk_idx - 1);
+        f_0 = response_db(pk_idx);
+        f_p = response_db(pk_idx + 1);
+        denom = f_m - 2 * f_0 + f_p;
+        if abs(denom) > eps
+            delta_i = (f_m - f_p) / (2 * denom);
+        else
+            delta_i = 0;
+        end
+        delta_i = max(-0.5, min(0.5, delta_i));
+        peak_r = distances(pk_idx) + delta_i * dr;
+    end
+
+    % -3 dB range bracket — find contiguous region around the peak
+    threshold = pk_val - 3;
+    above = response_db(:) >= threshold;
+
+    saturated = above(1) && above(end);
+
+    if saturated
+        % Response stays within 3 dB of peak across the whole search range
+        % — no useful range discrimination
+        range_3dB = distances(end) - distances(1);
+        r_lower_3dB = distances(1);
+        r_upper_3dB = distances(end);
+    else
+        d_above = diff([0; above; 0]);
+        starts = find(d_above == 1);
+        ends_arr = find(d_above == -1) - 1;
+        region = find(starts <= pk_idx & ends_arr >= pk_idx, 1);
+        if isempty(region)
+            range_3dB = NaN;
+            r_lower_3dB = NaN;
+            r_upper_3dB = NaN;
+        else
+            r_lower_3dB = distances(starts(region));
+            r_upper_3dB = distances(ends_arr(region));
+            range_3dB = r_upper_3dB - r_lower_3dB;
+        end
+    end
+end
+
+
+%% plot_ray_response
+function fig_handle = plot_ray_response(ray_distances, ray_resp_3dof, ray_resp_3dofS, ...
+    ray_resp_6dof, ray_resp_4dof, source_distance_m, lambda, ray_angle_deg, dist_lambda)
+
+    col_planar    = [0.250, 0.150, 0.040];
+    col_spherical = [0.550, 0.300, 0.080];
+    col_modified  = [0.850, 0.450, 0.100];
+    col_presonly  = [1.000, 0.700, 0.350];
+    fn = 'Times New Roman';
+
+    ray_distances_lambda = ray_distances / lambda;
+
+    fig_handle = figure('Color', 'w', 'Position', [100 100 520 360]);
+    plot(ray_distances_lambda, ray_resp_3dof, '-', ...
+        'Color', col_planar, 'LineWidth', 1.8, ...
+        'DisplayName', 'Planar $\mathbf{V}_3$');
+    hold on;
+    plot(ray_distances_lambda, ray_resp_3dofS, '-', ...
+        'Color', col_spherical, 'LineWidth', 1.8, ...
+        'DisplayName', 'Spherical $\mathbf{V}_3$');
+    plot(ray_distances_lambda, ray_resp_6dof, '-', ...
+        'Color', col_modified, 'LineWidth', 1.8, ...
+        'DisplayName', 'Modified $\mathbf{V}_6$');
+    plot(ray_distances_lambda, ray_resp_4dof, '-', ...
+        'Color', col_presonly, 'LineWidth', 1.8, ...
+        'DisplayName', 'Pressure-only $\mathbf{V}_4$');
+    xline(source_distance_m / lambda, 'k--', 'LineWidth', 1.2, ...
+        'DisplayName', 'True distance', 'HandleVisibility', 'on');
+    hold off;
+    xlabel('Distance along ray ($r / \lambda$)', 'Interpreter', 'latex', 'FontSize', 14);
+    ylabel('Normalised response (dB)', 'FontName', fn, 'FontSize', 14);
+    legend('Location', 'southeast', 'FontName', fn, 'FontSize', 11, ...
+        'Interpreter', 'latex', 'Box', 'on');
+    set(gca, 'FontName', fn, 'FontSize', 12, ...
+        'LineWidth', 1.0, 'Box', 'on', 'YGrid', 'on', 'XGrid', 'off');
+end
+
+
+%% beam_pattern_baseline — Planar V_3
+function [theta_deg, beam_pattern, fig_handle, beam_metrics] = ...
+    beam_pattern_baseline(r_vs, vs_centres, array_centre, source_positions, ...
+    bin_freqs, c_0, rho_0, loading, num_bins, N_v, radius, plot_title)
+
+    fprintf('  Computing Planar V_3 beam pattern (r = %.4f m)...\n', radius);
+    num_angles = 360;
+    theta_deg = linspace(0, 360, num_angles + 1);
+    theta_deg = theta_deg(1:end-1);
+    theta_rad = deg2rad(theta_deg);
+    mvdr_responses = zeros(num_angles, num_bins);
+
+    for jf = 1:num_bins
+        freq = bin_freqs(jf);
+        rf = squeeze(r_vs(:,:,jf));
+        [ur, er] = eig(rf);
+        erv = real(diag(er));
+        erv = max(erv, 1e-12);
+        lambda = loading * max(erv);
+        for angle_idx = 1:num_angles
+            x_pos = array_centre(1) + radius * sin(theta_rad(angle_idx));
+            y_pos = array_centre(2) + radius * cos(theta_rad(angle_idx));
+            source_pos = [x_pos; y_pos; 0];
+            v_vs = steering_vector_baseline(vs_centres, source_pos, freq, c_0, rho_0, N_v);
+            rxv = (ur * diag(1 ./ (erv + lambda)) * ur') * v_vs;
+            denominator = v_vs' * rxv;
+            if abs(denominator) > 1e-12
+                vmvdr = rxv / denominator;
+                mvdr_responses(angle_idx, jf) = abs(vmvdr' * rf * vmvdr);
+            end
+        end
+    end
+
+    beam_linear = sum(mvdr_responses, 2);
+    beam_pattern = 10 * log10(beam_linear + eps);
+    beam_pattern = beam_pattern - max(beam_pattern);
+
+    [fig_handle, beam_metrics] = plot_beam_pattern_polar(theta_rad, theta_deg, ...
+        beam_pattern, source_positions, array_centre, radius, plot_title);
+    print_beam_metrics(theta_deg, beam_pattern, beam_metrics);
+end
+
+
+%% beam_pattern_spherical — Spherical V_3 (Eq 15)
+function [theta_deg, beam_pattern, fig_handle, beam_metrics] = ...
+    beam_pattern_spherical(r_vs, vs_centres, array_centre, source_positions, ...
+    bin_freqs, c_0, rho_0, loading, num_bins, N_v, radius, plot_title)
+
+    fprintf('  Computing Spherical V_3 beam pattern (r = %.4f m)...\n', radius);
+    num_angles = 360;
+    theta_deg = linspace(0, 360, num_angles + 1);
+    theta_deg = theta_deg(1:end-1);
+    theta_rad = deg2rad(theta_deg);
+    mvdr_responses = zeros(num_angles, num_bins);
+
+    for jf = 1:num_bins
+        freq = bin_freqs(jf);
+        rf = squeeze(r_vs(:,:,jf));
+        [ur, er] = eig(rf);
+        erv = real(diag(er));
+        erv = max(erv, 1e-12);
+        lambda = loading * max(erv);
+        for angle_idx = 1:num_angles
+            x_pos = array_centre(1) + radius * sin(theta_rad(angle_idx));
+            y_pos = array_centre(2) + radius * cos(theta_rad(angle_idx));
+            source_pos = [x_pos; y_pos; 0];
+            v_vs = steering_vector_spherical(vs_centres, source_pos, freq, c_0, rho_0, N_v);
+            rxv = (ur * diag(1 ./ (erv + lambda)) * ur') * v_vs;
+            denominator = v_vs' * rxv;
+            if abs(denominator) > 1e-12
+                vmvdr = rxv / denominator;
+                mvdr_responses(angle_idx, jf) = abs(vmvdr' * rf * vmvdr);
+            end
+        end
+    end
+
+    beam_linear = sum(mvdr_responses, 2);
+    beam_pattern = 10 * log10(beam_linear + eps);
+    beam_pattern = beam_pattern - max(beam_pattern);
+
+    [fig_handle, beam_metrics] = plot_beam_pattern_polar(theta_rad, theta_deg, ...
+        beam_pattern, source_positions, array_centre, radius, plot_title);
+    print_beam_metrics(theta_deg, beam_pattern, beam_metrics);
+end
+
+
+%% beam_pattern_modified
+function [theta_deg, beam_pattern, fig_handle, beam_metrics] = ...
+    beam_pattern_modified(r_vs, vs_centres, mic_positions, array_centre, source_positions, ...
+    bin_freqs, c_0, rho_0, loading, num_bins, N_v, radius, plot_title)
+
+    fprintf('  Computing modified beam pattern (r = %.4f m)...\n', radius);
+    num_angles = 360;
+    theta_deg = linspace(0, 360, num_angles + 1);
+    theta_deg = theta_deg(1:end-1);
+    theta_rad = deg2rad(theta_deg);
+    mvdr_responses = zeros(num_angles, num_bins);
+
+    for jf = 1:num_bins
+        freq = bin_freqs(jf);
+        rf = squeeze(r_vs(:,:,jf));
+        [ur, er] = eig(rf);
+        erv = real(diag(er));
+        erv = max(erv, 1e-12);
+        lambda = loading * max(erv);
+        for angle_idx = 1:num_angles
+            x_pos = array_centre(1) + radius * sin(theta_rad(angle_idx));
+            y_pos = array_centre(2) + radius * cos(theta_rad(angle_idx));
+            source_pos = [x_pos; y_pos; 0];
+            v_vs = steering_vector_modified(vs_centres, mic_positions, source_pos, freq, c_0, rho_0, N_v);
+            rxv = (ur * diag(1 ./ (erv + lambda)) * ur') * v_vs;
+            denominator = v_vs' * rxv;
+            if abs(denominator) > 1e-12
+                vmvdr = rxv / denominator;
+                mvdr_responses(angle_idx, jf) = abs(vmvdr' * rf * vmvdr);
+            end
+        end
+    end
+
+    beam_linear = sum(mvdr_responses, 2);
+    beam_pattern = 10 * log10(beam_linear + eps);
+    beam_pattern = beam_pattern - max(beam_pattern);
+
+    [fig_handle, beam_metrics] = plot_beam_pattern_polar(theta_rad, theta_deg, ...
+        beam_pattern, source_positions, array_centre, radius, plot_title);
+    print_beam_metrics(theta_deg, beam_pattern, beam_metrics);
+end
+
+
+%% beam_pattern_pressure_only
+function [theta_deg, beam_pattern, fig_handle, beam_metrics] = ...
+    beam_pattern_pressure_only(r_vs, vs_centres, mic_positions, array_centre, source_positions, ...
+    bin_freqs, c_0, rho_0, loading, num_bins, N_v, radius, plot_title)
+
+    fprintf('  Computing pressure-only beam pattern (r = %.4f m)...\n', radius);
+    num_angles = 360;
+    theta_deg = linspace(0, 360, num_angles + 1);
+    theta_deg = theta_deg(1:end-1);
+    theta_rad = deg2rad(theta_deg);
+    mvdr_responses = zeros(num_angles, num_bins);
+
+    for jf = 1:num_bins
+        freq = bin_freqs(jf);
+        rf = squeeze(r_vs(:,:,jf));
+        [ur, er] = eig(rf);
+        erv = real(diag(er));
+        erv = max(erv, 1e-12);
+        lambda = loading * max(erv);
+        for angle_idx = 1:num_angles
+            x_pos = array_centre(1) + radius * sin(theta_rad(angle_idx));
+            y_pos = array_centre(2) + radius * cos(theta_rad(angle_idx));
+            source_pos = [x_pos; y_pos; 0];
+            v_vs = steering_vector_pressure_only(vs_centres, mic_positions, source_pos, freq, c_0, rho_0, N_v);
+            rxv = (ur * diag(1 ./ (erv + lambda)) * ur') * v_vs;
+            denominator = v_vs' * rxv;
+            if abs(denominator) > 1e-12
+                vmvdr = rxv / denominator;
+                mvdr_responses(angle_idx, jf) = abs(vmvdr' * rf * vmvdr);
+            end
+        end
+    end
+
+    beam_linear = sum(mvdr_responses, 2);
+    beam_pattern = 10 * log10(beam_linear + eps);
+    beam_pattern = beam_pattern - max(beam_pattern);
+
+    [fig_handle, beam_metrics] = plot_beam_pattern_polar(theta_rad, theta_deg, ...
+        beam_pattern, source_positions, array_centre, radius, plot_title);
+    print_beam_metrics(theta_deg, beam_pattern, beam_metrics);
+end
+
+
+%% plot_beam_pattern_polar
+function [fig_handle, beam_metrics] = plot_beam_pattern_polar(theta_rad, theta_deg, ...
+    beam_pattern, source_positions, array_centre, radius, plot_title)
+
+    fig_handle = figure('Name', plot_title, 'Position', [100, 100, 700, 700]);
+    polarplot(theta_rad, beam_pattern, 'b-', 'LineWidth', 2);
+    ax = gca;
+    ax.ThetaDir = 'clockwise';
+    ax.ThetaZeroLocation = 'top';
+    rlim([min(beam_pattern), 0]);
+    rticks_vals = linspace(min(beam_pattern), 0, 5);
+    rticks(rticks_vals);
+    rticklabels(arrayfun(@(x) sprintf('%.1f dB', x), rticks_vals, 'UniformOutput', false));
+
+    if ~isempty(source_positions)
+        hold on;
+        for src = 1:size(source_positions, 1)
+            source_vec = source_positions(src, :)' - array_centre;
+            source_angle_rad = atan2(source_vec(1), source_vec(2));
+            r_lim = rlim;
+            polarplot([source_angle_rad, source_angle_rad], r_lim, '--r', 'LineWidth', 2, ...
+                'DisplayName', sprintf('Source %d', src));
+        end
+        legend('Location', 'northoutside', 'Orientation', 'horizontal');
+        hold off;
+    end
+
+    title(sprintf('%s (r = %.3f m)', plot_title, radius), ...
+        'FontName', 'Times New Roman', 'FontSize', 16, 'FontWeight', 'bold');
+    ax.FontName = 'Times New Roman';
+    ax.FontSize = 12;
+
+    beam_metrics = struct();
+    [~, peak_idx] = max(beam_pattern);
+    threshold_3db = max(beam_pattern) - 3;
+    above = beam_pattern(:) >= threshold_3db;
+    d_above = diff([0; above; 0]);
+    starts = find(d_above == 1);
+    ends_arr = find(d_above == -1) - 1;
+
+    beam_metrics.beamwidth_3dB = NaN;
+    main_lobe_region = find(starts <= peak_idx & ends_arr >= peak_idx, 1);
+    if ~isempty(main_lobe_region)
+        bw = theta_deg(ends_arr(main_lobe_region)) - theta_deg(starts(main_lobe_region));
+        if bw < 0
+            bw = bw + 360;
+        end
+        beam_metrics.beamwidth_3dB = bw;
+    end
+
+    beam_metrics.sidelobe_level = NaN;
+    bp_col = beam_pattern(:);
+    if any(~above)
+        beam_metrics.sidelobe_level = max(bp_col(~above));
+    end
+
+    beam_linear = 10.^(beam_pattern(:) / 10);
+    integral_val = trapz(theta_rad(:), beam_linear);
+    beam_metrics.directivity_index = 10 * log10(2 * pi / integral_val);
+end
+
+
+%% print_beam_metrics
+function print_beam_metrics(theta_deg, beam_pattern, beam_metrics)
+    fprintf('  Beam Pattern Statistics:\n');
+    [~, peak_idx] = max(beam_pattern);
+    fprintf('    Peak response: 0.00 dB at %.1f degrees\n', theta_deg(peak_idx));
+    if ~isnan(beam_metrics.beamwidth_3dB)
+        fprintf('    -3 dB beamwidth: %.1f degrees\n', beam_metrics.beamwidth_3dB);
+    else
+        fprintf('    WARNING: could not identify main lobe region\n');
+    end
+    if ~isnan(beam_metrics.sidelobe_level)
+        fprintf('    Maximum sidelobe level: %.2f dB\n', beam_metrics.sidelobe_level);
+    end
+    fprintf('    Directivity index: %.2f dB\n', beam_metrics.directivity_index);
+end
+
+
+%% compute_angular_error
+function angular_error_deg = compute_angular_error(true_pos, est_pos, ref_pos)
+    true_angle = atan2(true_pos(2) - ref_pos(2), true_pos(1) - ref_pos(1));
+    est_angle = atan2(est_pos(2) - ref_pos(2), est_pos(1) - ref_pos(1));
+    angular_error_deg = rad2deg(abs(true_angle - est_angle));
+    if angular_error_deg > 180
+        angular_error_deg = 360 - angular_error_deg;
+    end
+end
+
+
+%% build_search_grid
+function [x_scan, y_scan, X_grid, Y_grid, candidate_points, grid_res] = ...
+    build_search_grid(test_freq, c_0, source_distance, array_centre_y, ...
+    grid_pts_per_lambda, margin_fixed)
+
+    lambda = c_0 / test_freq;
+    grid_resolution = lambda / grid_pts_per_lambda;
+    max_extent = source_distance + margin_fixed;
+    x_scan_points = round(2 * max_extent / grid_resolution) + 1;
+    y_scan_points = round(2 * max_extent / grid_resolution) + 1;
+    x_scan = linspace(-max_extent, max_extent, x_scan_points);
+    y_scan = linspace(array_centre_y - max_extent, array_centre_y + max_extent, y_scan_points);
+    [X_grid, Y_grid] = meshgrid(x_scan, y_scan);
+    candidate_points = [X_grid(:), Y_grid(:), zeros(numel(X_grid), 1)];
+    x_res = x_scan(2) - x_scan(1);
+    y_res = y_scan(2) - y_scan(1);
+    grid_res = mean([x_res, y_res]);
+end
+
+
+%% refine_peak_2d
+function [est_x, est_y, refined_db] = refine_peak_2d(grid_response, x_scan, y_scan)
+    [~, max_idx] = max(grid_response(:));
+    [iy_pk, ix_pk] = ind2sub(size(grid_response), max_idx);
+    est_x_discrete = x_scan(ix_pk);
+    est_y_discrete = y_scan(iy_pk);
+    dx = x_scan(2) - x_scan(1);
+    dy = y_scan(2) - y_scan(1);
+
+    if ix_pk < 2 || ix_pk > length(x_scan) - 1 || ...
+       iy_pk < 2 || iy_pk > length(y_scan) - 1
+        warning('refine_peak_2d:boundary', ...
+            'Discrete peak at grid boundary — returning discrete estimate.');
+        est_x = est_x_discrete;
+        est_y = est_y_discrete;
+        refined_db = grid_response(iy_pk, ix_pk);
+        return;
+    end
+
+    fx_m = grid_response(iy_pk, ix_pk - 1);
+    fx_0 = grid_response(iy_pk, ix_pk);
+    fx_p = grid_response(iy_pk, ix_pk + 1);
+    denom_x = fx_m - 2 * fx_0 + fx_p;
+    if abs(denom_x) > eps
+        delta_ix = (fx_m - fx_p) / (2 * denom_x);
+    else
+        delta_ix = 0;
+    end
+
+    fy_m = grid_response(iy_pk - 1, ix_pk);
+    fy_0 = grid_response(iy_pk, ix_pk);
+    fy_p = grid_response(iy_pk + 1, ix_pk);
+    denom_y = fy_m - 2 * fy_0 + fy_p;
+    if abs(denom_y) > eps
+        delta_iy = (fy_m - fy_p) / (2 * denom_y);
+    else
+        delta_iy = 0;
+    end
+
+    delta_ix = max(-0.5, min(0.5, delta_ix));
+    delta_iy = max(-0.5, min(0.5, delta_iy));
+    est_x = est_x_discrete + delta_ix * dx;
+    est_y = est_y_discrete + delta_iy * dy;
+    refined_db = fx_0 - (fx_m - fx_p)^2 / (8 * denom_x);
+
+    shift_m = sqrt((delta_ix * dx)^2 + (delta_iy * dy)^2);
+    fprintf('  refine_peak_2d: discrete (%.4f, %.4f) -> refined (%.4f, %.4f) | shift %.4f m\n', ...
+        est_x_discrete, est_y_discrete, est_x, est_y, shift_m);
+end
+
+
+%% sat_label
+function s = sat_label(saturated)
+    if saturated
+        s = '(SATURATED — no range resolution)';
+    else
+        s = '';
+    end
+end
